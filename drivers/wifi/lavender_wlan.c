@@ -148,6 +148,7 @@ struct smp2p_entry {
 static vm_offset_t gcc, smmu, smem, msa, apcs, tcsr;
 static int wlan_chan;
 static uint32_t wlan_mode;
+static uint32_t g_cacheline = 0x20;
 
 void lavender_wlan_after_modem(void);
 
@@ -322,6 +323,8 @@ wlan_f2_partition(uint8_t *base, uint16_t a, uint16_t b)
 		}
 		if ((e[i].host0 == a && e[i].host1 == b) ||
 		    (e[i].host0 == b && e[i].host1 == a)) {
+			g_cacheline = e[i].cacheline != 0 ? e[i].cacheline :
+			    0x20;
 			return (struct smem_part_hdr *)(base + e[i].offset);
 		}
 	}
@@ -355,8 +358,8 @@ wlan_f2_toc(uint8_t *base)
 			continue;
 		}
 		printf("SWEET WLAN: toc[%u] off %05x size %05x host %04x/%04x "
-		    "flags %x\n", i, e[i].offset, e[i].size, e[i].host0,
-		    e[i].host1, e[i].flags);
+		    "flags %x cl %x\n", i, e[i].offset, e[i].size, e[i].host0,
+		    e[i].host1, e[i].flags, e[i].cacheline);
 		/*
 		 * 0713: only read partitions with an APPS host. The 0712 boot
 		 * hung on the first modem<->adsp partition (0x1/0x2) header;
@@ -448,24 +451,75 @@ wlan_f2_items(struct smem_part_hdr *p)
 }
 
 /*
- * 0713: the partition has an uncached area growing up from offset_free_uncached
- * and a cached area packed down from the end; qcom_smem walks the latter from
- * free_cached upward. One 0x4000-byte item is already there, so the GLINK
- * FIFO may live in this half.
+ * 0716: cached SMEM entries grow DOWN from the end and the header comes
+ * AFTER the data: downstream qcom_smem has cached_entry_to_item(e) = e - size
+ * and cached_entry_next(e) = e - size - ALIGN(sizeof(e), cacheline). The
+ * modem's GLINK TX FIFO (item 480, 0x4000 bytes) is one of these, so the
+ * uncached walk never saw it. With size 0x94000 and free_cached 0x8ffe0 the
+ * header sits at 0x93fe0 and the data at 0x8ffe0.
  */
+static uint32_t
+wlan_cached_hdr(void)
+{
+	uint32_t cl = g_cacheline != 0 ? g_cacheline : 0x20;
+
+	return (sizeof(struct smem_priv_entry) + cl - 1) & ~(cl - 1);
+}
+
+static void *
+wlan_f2_item_cached(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+{
+	uint8_t *base = (uint8_t *)p;
+	uint32_t hdr = wlan_cached_hdr();
+	uint32_t pos, last;
+
+	if (p == NULL || memcmp(p->magic, "$PRT", 4) != 0 ||
+	    p->free_cached > p->size || p->size < hdr) {
+		return NULL;
+	}
+	last = p->free_cached;
+	pos = p->size - hdr;
+	while (pos >= last && pos + sizeof(struct smem_priv_entry) <= p->size) {
+		struct smem_priv_entry *e =
+		    (struct smem_priv_entry *)(base + pos);
+
+		if (e->canary != 0xa5a5) {
+			return NULL;
+		}
+		if (e->item == item) {
+			if (e->size > pos) {
+				return NULL;
+			}
+			if (size != NULL) {
+				*size = e->size - e->pad_data;
+			}
+			return base + pos - e->size;
+		}
+		if (e->size + hdr > pos - last) {
+			return NULL;
+		}
+		pos -= e->size + hdr;
+	}
+	return NULL;
+}
+
 static void
 wlan_f2_items_cached(struct smem_part_hdr *p)
 {
 	uint8_t *base = (uint8_t *)p;
-	uint32_t pos = p->free_cached;
+	uint32_t hdr = wlan_cached_hdr();
+	uint32_t pos, last;
 	unsigned n = 0;
 
-	if (p->free_cached < sizeof(*p) || p->free_cached > p->size) {
+	if (p->free_cached > p->size || p->size < hdr) {
 		printf("SWEET WLAN: cached area %x/%x (not walked)\n",
 		    p->free_cached, p->size);
 		return;
 	}
-	while (pos + sizeof(struct smem_priv_entry) <= p->size && n < 64) {
+	last = p->free_cached;
+	pos = p->size - hdr;
+	while (pos >= last && pos + sizeof(struct smem_priv_entry) <= p->size &&
+	    n < 64) {
 		struct smem_priv_entry *h =
 		    (struct smem_priv_entry *)(base + pos);
 
@@ -474,20 +528,16 @@ wlan_f2_items_cached(struct smem_part_hdr *p)
 			    "%04x)\n", n, h->canary);
 			break;
 		}
-		printf("SWEET WLAN: cached item %u size %u pad %u/%u\n", h->item,
-		    h->size, h->pad_data, h->pad_hdr);
-		if (h->item == ITEM_GLINK_DESC && h->size >= 32) {
-			uint32_t *d = (uint32_t *)(void *)(h + 1);
-
-			printf("SWEET WLAN: glink desc(c) %08x %08x %08x %08x "
-			    "%08x %08x %08x %08x\n", d[0], d[1], d[2], d[3],
-			    d[4], d[5], d[6], d[7]);
+		printf("SWEET WLAN: cached item %u size %u pad %u/%u at %x\n",
+		    h->item, h->size, h->pad_data, h->pad_hdr, pos);
+		if (h->size + hdr > pos - last) {
+			break;
 		}
-		pos += sizeof(*h) + h->pad_hdr + h->size;
+		pos -= h->size + hdr;
 		n++;
 	}
-	printf("SWEET WLAN: %u cached items from %x to %x\n", n,
-	    p->free_cached, p->size);
+	printf("SWEET WLAN: %u cached items, free_cached %x size %x cl %x\n",
+	    n, p->free_cached, p->size, g_cacheline);
 }
 
 /* --- F2 step 2: SMP2P out (writes SMEM under the APPS hwlock) ------------ */
@@ -752,6 +802,7 @@ static uint8_t q_tx[512];
 static uint8_t q_pending[256];
 static uint32_t q_pending_len;
 static unsigned g_ms, g_tx_msgs, g_rx_msgs;
+static uint32_t g_last_desc[4];
 
 static void
 wlan_mb(void)
@@ -1242,14 +1293,47 @@ wlan_rx_one(void)
 	return TRUE;
 }
 
+static uint8_t *
+wlan_glink_rx_fifo(struct smem_part_hdr *part, uint32_t *sz)
+{
+	uint8_t *v = (uint8_t *)wlan_f2_item_cached(part, ITEM_GLINK_RX, sz);
+
+	if (v != NULL) {
+		return v;
+	}
+	return (uint8_t *)wlan_f2_item(part, ITEM_GLINK_RX, sz);
+}
+
 static void
 wlan_glink_poll(unsigned ms)
 {
 	g_ms = ms;
+	if (g_desc != NULL) {
+		uint32_t d0 = g_desc[0], d1 = g_desc[1], d2 = g_desc[2];
+		uint32_t d3 = g_desc[3];
+
+		if (d0 != g_last_desc[0] || d1 != g_last_desc[1] ||
+		    d2 != g_last_desc[2] || d3 != g_last_desc[3]) {
+			g_last_desc[0] = d0;
+			g_last_desc[1] = d1;
+			g_last_desc[2] = d2;
+			g_last_desc[3] = d3;
+			printf("SWEET WLAN: t=%u desc tx %x/%x rx %x/%x\n",
+			    ms, d0, d1, d2, d3);
+		}
+	}
+	/* Re-ring while the remote has not answered: it may have missed the
+	 * first doorbell if its transport was still initializing. */
+	if (!g_remote_open && g_tx != NULL && ms != 0 && (ms % 500) == 0 &&
+	    apcs != 0) {
+		*(volatile uint32_t *)(apcs + APCS_IPC_OFF) =
+		    1u << GLINK_IRQ_BIT;
+		wlan_mb();
+	}
 	if (g_rx == NULL && g_part != NULL) {
 		uint32_t sz = 0;
 
-		g_rx = (uint8_t *)wlan_f2_item(g_part, ITEM_GLINK_RX, &sz);
+		g_rx = wlan_glink_rx_fifo(g_part, &sz);
 		if (g_rx != NULL) {
 			g_rx_len = sz;
 			printf("SWEET WLAN: glink modem RX FIFO %u bytes\n",
@@ -1323,7 +1407,7 @@ wlan_glink_start(struct smem_part_hdr *part)
 		printf("SWEET WLAN: glink TX FIFO allocation failed\n");
 		return FALSE;
 	}
-	g_rx = (uint8_t *)wlan_f2_item(part, ITEM_GLINK_RX, &sz);
+	g_rx = wlan_glink_rx_fifo(part, &sz);
 	if (g_rx != NULL) {
 		g_rx_len = sz;
 	}
