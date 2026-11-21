@@ -49,10 +49,11 @@
 
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern int santoni_emmc_read(uint64_t lba, uint32_t count, void *buf);
 
-#define IO_CHUNK        (2u << 20)      /* io_submap is 8 MiB total */
+#define IO_CHUNK        (2u << 20)      /* windows into the 118 MiB image */
 
 #define GCC_PA          0x00100000u
 #define GCC_SIZE        0x94000u
@@ -212,29 +213,15 @@ io_copy(vm_offset_t dst, const void *src, uint32_t n)
 }
 
 /*
- * 0709: io_submap is only 8 MiB (osfmk/arm/io_map.c IO_MAP_SIZE). Mapping the
- * whole 118 MiB modem region wedged the caller in kmem_alloc(KMA_NOFAIL), so
- * write/zero through 2 MiB windows and unmap each one.
+ * 0709: io_submap is only 8 MiB (osfmk/arm/io_map.c IO_MAP_SIZE), so the
+ * 118 MiB image cannot be mapped in one go: 0708 wedged inside
+ * ml_io_map()/kmem_alloc(KMA_NOFAIL). Copy through 2 MiB windows instead.
+ * The windows use ml_io_map_unmappable(), which allocates in kernel_map,
+ * because that is the map ml_io_unmap() frees. ml_io_map() allocates from
+ * io_submap, whose parent entry is permanent, so ml_io_unmap() cannot
+ * release it. pmap_remove() wants page-aligned bounds: unmap from
+ * trunc_page(va) with round_page(offset + length).
  */
-static int
-io_write_pa(uint32_t pa, const void *src, uint32_t n)
-{
-	uint32_t off = 0;
-
-	while (off < n) {
-		uint32_t chunk = MIN(n - off, IO_CHUNK);
-		vm_offset_t va = ml_io_map(pa + off, chunk);
-
-		if (va == 0) {
-			return ENOMEM;
-		}
-		io_copy(va, (const uint8_t *)src + off, chunk);
-		ml_io_unmap(va, chunk);
-		off += chunk;
-	}
-	return 0;
-}
-
 static int
 io_zero_pa(uint32_t pa, uint32_t n)
 {
@@ -242,13 +229,15 @@ io_zero_pa(uint32_t pa, uint32_t n)
 
 	while (off < n) {
 		uint32_t chunk = MIN(n - off, IO_CHUNK);
-		vm_offset_t va = ml_io_map(pa + off, chunk);
+		vm_offset_t va = ml_io_map_unmappable(pa + off, chunk,
+		    VM_WIMG_IO);
 
 		if (va == 0) {
 			return ENOMEM;
 		}
 		io_zero(va, chunk);
-		ml_io_unmap(va, chunk);
+		ml_io_unmap(trunc_page(va),
+		    round_page(va - trunc_page(va) + chunk));
 		off += chunk;
 	}
 	return 0;
@@ -258,6 +247,7 @@ static void
 modem_wait(unsigned ms)
 {
 	uint64_t deadline;
+
 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
 	(void)assert_wait_deadline(&modem_chan, THREAD_UNINT, deadline);
 	thread_block(THREAD_CONTINUE_NULL);
@@ -733,11 +723,15 @@ fat_read_to_buf(const char *name, void *dst, uint32_t max, uint32_t *out)
 	return 0;
 }
 
-/* Stream one segment blob; its directory size must match p_filesz. */
+/*
+ * Stream one segment blob; its directory size must match p_filesz. The blob
+ * is copied into the modem carve-out through IO_CHUNK windows.
+ */
 static int
 fat_read_blob(const char *name, uint32_t pa, uint32_t want)
 {
-	uint32_t cluster, size, off = 0;
+	uint32_t cluster, size, off = 0, win = 0, used = 0;
+	vm_offset_t va = 0;
 	int err;
 
 	err = fat_lookup(name, &cluster, &size);
@@ -751,32 +745,48 @@ fat_read_blob(const char *name, uint32_t pa, uint32_t want)
 		return EINVAL;
 	}
 	while (off < size) {
-		uint32_t n = MIN(size - off, fat_cluster_bytes);
+		uint32_t n;
 
+		if (va == 0 || used == win) {
+			if (va != 0) {
+				ml_io_unmap(trunc_page(va),
+				    round_page(va - trunc_page(va) + win));
+			}
+			win = MIN(size - off, IO_CHUNK);
+			va = ml_io_map_unmappable(pa + off, win, VM_WIMG_IO);
+			if (va == 0) {
+				printf("SWEET MODEM: %s map failed at %u\n",
+				    name, off);
+				return ENOMEM;
+			}
+			used = 0;
+		}
+		n = MIN(size - off, fat_cluster_bytes);
 		err = emmc_read(MODEM_LBA + fat_cluster_sector(cluster),
 		    fat_spc, bounce);
 		if (err) {
 			printf("SWEET MODEM: %s read failed %d at %u\n", name,
 			    err, off);
-			return err;
+			break;
 		}
-		err = io_write_pa(pa + off, bounce, n);
-		if (err) {
-			printf("SWEET MODEM: %s write failed %d at %u\n", name,
-			    err, off);
-			return err;
-		}
+		io_copy(va + used, bounce, n);
+		used += n;
 		off += n;
 		if (off < size) {
 			cluster = fat_next(cluster);
 			if (cluster < 2 || cluster >= FAT_MAX_CLUSTER) {
 				printf("SWEET MODEM: %s chain ends at %u/%u\n",
 				    name, off, size);
-				return EIO;
+				err = EIO;
+				break;
 			}
 		}
 	}
-	return 0;
+	if (va != 0) {
+		ml_io_unmap(trunc_page(va),
+		    round_page(va - trunc_page(va) + win));
+	}
+	return err;
 }
 
 /* --- MBA ------------------------------------------------------------------ */
@@ -1057,7 +1067,7 @@ modem_load_segments(void)
 	region_size = region_end - region_start;
 	printf("SWEET MODEM: modem image %08x..%08x (%u bytes)\n", region_start,
 	    region_end, region_size);
-	/* The image is written through io_write_pa()/io_zero_pa() windows. */
+	/* The image is written through io_zero_pa()/fat_read_blob() windows. */
 
 	{
 		uint32_t src[1] = { VMID_HLOS };
