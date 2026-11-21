@@ -134,6 +134,7 @@ extern int santoni_emmc_read(uint64_t lba, uint32_t count, void *buf);
 #define PERM_WRITE              0x2u
 #define PERM_EXEC               0x1u
 #define SCM_ARGINFO_7           0x1117u  /* SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL) */
+#define SCM_CHUNK               (2u << 20) /* secure_buffer.c BATCH_MAX_SIZE */
 
 /* modem FAT16 (GPT: modem at LBA 786432; BPB: 512/32/1/2/512/49) */
 #define MODEM_LBA               786432ull
@@ -969,6 +970,7 @@ modem_load_segments(void)
 	const uint8_t *ph;
 	uint32_t phoff, phnum, region_start = 0xffffffffu, region_end = 0;
 	uint32_t i, len, paddr, filesz, memsz, status;
+	uint32_t off, chunk, region_size;
 	vm_offset_t fw;
 	int err;
 
@@ -1003,9 +1005,12 @@ modem_load_segments(void)
 		    "carve-out\n", region_start, region_end);
 		return EINVAL;
 	}
+	region_size = region_end - region_start;
 	printf("SWEET MODEM: modem image %08x..%08x (%u bytes)\n", region_start,
-	    region_end, region_end - region_start);
-	fw = ml_io_map(region_start, region_end - region_start);
+	    region_end, region_size);
+	printf("SWEET MODEM: about to map the modem region\n");
+	fw = ml_io_map(region_start, region_size);
+	printf("SWEET MODEM: modem region mapped at va %08x\n", (uint32_t)fw);
 	if (fw == 0) {
 		printf("SWEET MODEM: modem region map failed\n");
 		return ENOMEM;
@@ -1017,11 +1022,16 @@ modem_load_segments(void)
 		uint32_t perm[2] = { PERM_READ | PERM_WRITE,
 		    PERM_READ | PERM_WRITE };
 
-		err = scm_mem_assign(region_start, region_end - region_start,
-		    src, 1, dst, perm, 2);
-	}
-	if (err) {
-		return EIO;
+		for (off = 0; off < region_size; off += SCM_CHUNK) {
+			chunk = MIN(SCM_CHUNK, region_size - off);
+			printf("SWEET MODEM: region chunk %08x+%x\n",
+			    region_start + off, chunk);
+			err = scm_mem_assign(region_start + off, chunk, src, 1,
+			    dst, perm, 2);
+			if (err) {
+				return EIO;
+			}
+		}
 	}
 
 	len = 0;
@@ -1074,11 +1084,16 @@ modem_load_segments(void)
 		uint32_t dst[1] = { VMID_MSS_MSA };
 		uint32_t perm[1] = { PERM_READ | PERM_WRITE };
 
-		err = scm_mem_assign(region_start, region_end - region_start,
-		    src, 2, dst, perm, 1);
-	}
-	if (err) {
-		return EIO;
+		for (off = 0; off < region_size; off += SCM_CHUNK) {
+			chunk = MIN(SCM_CHUNK, region_size - off);
+			printf("SWEET MODEM: reclaim chunk %08x+%x\n",
+			    region_start + off, chunk);
+			err = scm_mem_assign(region_start + off, chunk, src, 2,
+			    dst, perm, 1);
+			if (err) {
+				return EIO;
+			}
+		}
 	}
 	return 0;
 }
