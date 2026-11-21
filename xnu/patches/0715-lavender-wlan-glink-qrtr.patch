@@ -1,0 +1,697 @@
+diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
+index 3a81915..7bd482f 100644
+--- a/bsd/dev/lavender_wlan.c
++++ b/bsd/dev/lavender_wlan.c
+@@ -675,6 +675,669 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
+ 	}
+ }
+ 
++/* --- F2 step 3: GLINK over SMEM + QRTR ----------------------------------- */
++
++#define GLINK_TX_SIZE     0x4000u
++#define GLINK_IRQ_BIT     15
++#define GLINK_FEATURES    1             /* INTENT_REUSE */
++#define GLINK_CHAN_NAME   "IPCRTR"
++#define GLINK_LCID        1
++#define GLINK_OUR_INTENTS 8
++#define GLINK_INTENT_SIZE 0x4400u
++#define GLINK_MAX_INTENTS 128
++
++#define CMD_VERSION           0
++#define CMD_VERSION_ACK       1
++#define CMD_OPEN              2
++#define CMD_CLOSE             3
++#define CMD_OPEN_ACK          4
++#define CMD_INTENT            5
++#define CMD_RX_DONE           6
++#define CMD_RX_INTENT_REQ     7
++#define CMD_RX_INTENT_REQ_ACK 8
++#define CMD_TX_DATA           9
++#define CMD_CLOSE_ACK         11
++#define CMD_TX_DATA_CONT      12
++#define CMD_READ_NOTIF        13
++#define CMD_RX_DONE_W_REUSE   14
++#define CMD_SIGNALS           15
++
++#define QRTR_NODE_APPS    1
++#define QRTR_PORT_CTRL    0xfffffffeu
++#define QRTR_NODE_BCAST   0xffffffffu
++#define QRTR_TYPE_DATA    1
++#define QRTR_TYPE_HELLO   2
++#define QRTR_TYPE_NEW_SERVER 4
++#define QRTR_TYPE_RESUME_TX 7
++#define QMI_SVC_WLFW      0x45
++
++struct glink_msg {
++	uint16_t cmd, p1;
++	uint32_t p2;
++} __attribute__((packed));
++struct glink_data_hdr {
++	struct glink_msg m;
++	uint32_t chunk, left;
++} __attribute__((packed));
++struct qrtr_hdr_v1 {
++	uint32_t version, type, src_node, src_port, confirm_rx, size;
++	uint32_t dst_node, dst_port;
++} __attribute__((packed));
++struct qrtr_hdr_v2 {
++	uint8_t version, type, flags, optlen;
++	uint32_t size;
++	uint16_t src_node, src_port, dst_node, dst_port;
++} __attribute__((packed));
++struct qrtr_ctrl {
++	uint32_t cmd, a, b, c, d;
++} __attribute__((packed));
++
++static struct smem_part_hdr *g_part;
++static volatile uint32_t *g_desc;
++static uint8_t *g_tx, *g_rx;
++static uint32_t g_rx_len, g_features = GLINK_FEATURES, g_rcid;
++static uint32_t g_next_intent = 1;
++static boolean_t g_remote_open, g_open_sent, g_open_acked, g_intents_sent;
++static boolean_t g_intent_req_sent;
++static struct {
++	uint32_t id, size;
++	boolean_t used;
++} g_ri[GLINK_MAX_INTENTS];
++static unsigned g_ri_count;
++static uint8_t g_asm[GLINK_INTENT_SIZE];
++static uint32_t g_asm_len;
++static uint32_t q_ver = 1, q_modem_node = QRTR_NODE_BCAST;
++static boolean_t q_hello_sent, q_hello_rx, q_wlfw_seen;
++static uint8_t q_tx[512];
++static uint8_t q_pending[256];
++static uint32_t q_pending_len;
++static unsigned g_ms, g_tx_msgs, g_rx_msgs;
++
++static void
++wlan_mb(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static uint32_t
++wlan_rx_avail(void)
++{
++	uint32_t h, t;
++
++	if (g_desc == NULL || g_rx == NULL) {
++		return 0;
++	}
++	h = g_desc[3];
++	t = g_desc[2];
++	return h >= t ? h - t : g_rx_len - t + h;
++}
++
++static void
++wlan_rx_peek(uint32_t off, void *dst, uint32_t n)
++{
++	uint32_t t = g_desc[2] + off;
++	uint32_t n1;
++
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	n1 = MIN(n, g_rx_len - t);
++	memcpy(dst, g_rx + t, n1);
++	if (n > n1) {
++		memcpy((uint8_t *)dst + n1, g_rx, n - n1);
++	}
++}
++
++static void
++wlan_rx_advance(uint32_t n)
++{
++	uint32_t t = g_desc[2] + n;
++
++	if (t >= g_rx_len) {
++		t -= g_rx_len;
++	}
++	wlan_mb();
++	g_desc[2] = t;
++}
++
++static uint32_t
++wlan_tx_put(uint32_t head, const void *src, uint32_t n)
++{
++	uint32_t n1 = MIN(n, GLINK_TX_SIZE - head);
++
++	memcpy(g_tx + head, src, n1);
++	if (n > n1) {
++		memcpy(g_tx, (const uint8_t *)src + n1, n - n1);
++	}
++	head += n;
++	return head >= GLINK_TX_SIZE ? head - GLINK_TX_SIZE : head;
++}
++
++static boolean_t
++wlan_tx_write(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	uint32_t head = 0, tail = 0, avail = 0, need;
++	int n;
++
++	if (g_desc == NULL || g_tx == NULL) {
++		return FALSE;
++	}
++	need = (hlen + dlen + 7) & ~7u;
++	for (n = 0; n < 1000; n++) {
++		head = g_desc[1];
++		tail = g_desc[0];
++		avail = tail <= head ? GLINK_TX_SIZE - head + tail :
++		    tail - head;
++		avail = avail < 8 ? 0 : avail - 8;
++		if (avail >= need) {
++			break;
++		}
++		delay(100);
++	}
++	if (n == 1000) {
++		printf("SWEET WLAN: glink TX FIFO full (head %x tail %x)\n",
++		    head, tail);
++		return FALSE;
++	}
++	head = wlan_tx_put(head, hdr, hlen);
++	if (dlen != 0) {
++		head = wlan_tx_put(head, data, dlen);
++	}
++	head = (head + 7) & ~7u;
++	if (head >= GLINK_TX_SIZE) {
++		head -= GLINK_TX_SIZE;
++	}
++	wlan_mb();
++	g_desc[1] = head;
++	wlan_mb();
++	if (apcs != 0) {
++		*(volatile uint32_t *)(apcs + APCS_IPC_OFF) =
++		    1u << GLINK_IRQ_BIT;
++	}
++	wlan_mb();
++	g_tx_msgs++;
++	return TRUE;
++}
++
++static void
++wlan_glink_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	struct glink_msg m = { cmd, p1, p2 };
++
++	(void)wlan_tx_write(&m, sizeof(m), NULL, 0);
++}
++
++static void
++wlan_glink_open(void)
++{
++	struct {
++		struct glink_msg m;
++		char name[8];
++	} __attribute__((packed)) req = { { CMD_OPEN, GLINK_LCID,
++		sizeof(GLINK_CHAN_NAME) }, GLINK_CHAN_NAME };
++
++	(void)wlan_tx_write(&req, sizeof(req), NULL, 0);
++	g_open_sent = TRUE;
++}
++
++static void
++wlan_glink_intents(uint32_t count, uint32_t size)
++{
++	struct {
++		struct glink_msg m;
++		uint32_t pair[2 * GLINK_OUR_INTENTS];
++	} __attribute__((packed)) m = { { CMD_INTENT, GLINK_LCID, count } };
++
++	for (uint32_t i = 0; i < count && i < GLINK_OUR_INTENTS; i++) {
++		m.pair[2 * i] = size;
++		m.pair[2 * i + 1] = g_next_intent++;
++	}
++	(void)wlan_tx_write(&m, sizeof(struct glink_msg) + 8 * count, NULL, 0);
++}
++
++static boolean_t
++wlan_chan_up(void)
++{
++	return g_remote_open && g_open_acked;
++}
++
++static const char *
++wlan_svc_name(uint32_t svc)
++{
++	switch (svc) {
++	case 0x45: return "WLFW";
++	case 0x0e: return "rmtfs";
++	case 0x40: return "servreg-loc";
++	case 0x42: return "servreg-notif";
++	case 0x2b: return "ssctl";
++	case 0x31: return "ipa";
++	case 0x01: return "wds";
++	case 0x02: return "dms";
++	case 0x03: return "nas";
++	case 0x0b: return "uim";
++	case 0x1a: return "wda";
++	default:   return "";
++	}
++}
++
++/* Queue one QRTR packet into a modem RX intent; one pending packet at a time. */
++static boolean_t
++wlan_glink_send(const void *data, uint32_t len)
++{
++	unsigned i;
++
++	if (q_pending_len != 0) {
++		return FALSE;
++	}
++	for (i = 0; i < g_ri_count; i++) {
++		if (!g_ri[i].used && g_ri[i].size >= len) {
++			break;
++		}
++	}
++	if (i == g_ri_count) {
++		if (len <= sizeof(q_pending)) {
++			memcpy(q_pending, data, len);
++			q_pending_len = len;
++		}
++		if (!g_intent_req_sent) {
++			wlan_glink_cmd(CMD_RX_INTENT_REQ, GLINK_LCID, len);
++			g_intent_req_sent = TRUE;
++		}
++		return FALSE;
++	}
++	{
++		struct glink_data_hdr h = { { CMD_TX_DATA, GLINK_LCID,
++		    g_ri[i].id }, len, 0 };
++
++		g_ri[i].used = TRUE;
++		if (!wlan_tx_write(&h, sizeof(h), data, len)) {
++			g_ri[i].used = FALSE;
++			if (len <= sizeof(q_pending)) {
++				memcpy(q_pending, data, len);
++				q_pending_len = len;
++			}
++			return FALSE;
++		}
++	}
++	return TRUE;
++}
++
++static void
++wlan_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node,
++    uint32_t dst_port, const void *payload, uint32_t len)
++{
++	uint32_t hlen, total;
++
++	if (len + 40 > sizeof(q_tx)) {
++		return;
++	}
++	memset(q_tx, 0, sizeof(q_tx));
++	if (q_ver == 2) {
++		struct qrtr_hdr_v2 *h = (struct qrtr_hdr_v2 *)(void *)q_tx;
++
++		h->version = 2;
++		h->type = (uint8_t)type;
++		h->flags = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = (uint16_t)src_port;
++		h->dst_node = (uint16_t)dst_node;
++		h->dst_port = (uint16_t)dst_port;
++		hlen = sizeof(*h);
++	} else {
++		struct qrtr_hdr_v1 *h = (struct qrtr_hdr_v1 *)(void *)q_tx;
++
++		h->version = 1;
++		h->type = type;
++		h->src_node = QRTR_NODE_APPS;
++		h->src_port = src_port;
++		h->confirm_rx = type == QRTR_TYPE_DATA ? 1 : 0;
++		h->size = len;
++		h->dst_node = dst_node;
++		h->dst_port = dst_port;
++		hlen = sizeof(*h);
++	}
++	memcpy(q_tx + hlen, payload, len);
++	total = (hlen + len + 3) & ~3u;
++	(void)wlan_glink_send(q_tx, total);
++}
++
++static void
++wlan_qrtr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t type, src_node, src_port, dst_port, size, hlen, confirm;
++	const struct qrtr_ctrl *c;
++
++	if (len >= sizeof(struct qrtr_hdr_v1) && p[0] == 1 && p[1] == 0 &&
++	    p[2] == 0 && p[3] == 0) {
++		const struct qrtr_hdr_v1 *h =
++		    (const struct qrtr_hdr_v1 *)(const void *)p;
++
++		type = h->type;
++		src_node = h->src_node;
++		src_port = h->src_port;
++		dst_port = h->dst_port;
++		size = h->size;
++		hlen = sizeof(*h);
++		confirm = h->confirm_rx;
++		q_ver = 1;
++	} else if (len >= sizeof(struct qrtr_hdr_v2) && p[0] == 2) {
++		const struct qrtr_hdr_v2 *h =
++		    (const struct qrtr_hdr_v2 *)(const void *)p;
++
++		type = h->type;
++		src_node = h->src_node;
++		src_port = h->src_port == 0xfffe ? QRTR_PORT_CTRL : h->src_port;
++		dst_port = h->dst_port == 0xfffe ? QRTR_PORT_CTRL : h->dst_port;
++		size = h->size;
++		hlen = sizeof(*h) + h->optlen * 4;
++		confirm = h->flags & 1;
++		q_ver = 2;
++	} else {
++		printf("SWEET WLAN: qrtr bad packet, %u bytes\n", len);
++		return;
++	}
++	if (hlen + size > len) {
++		return;
++	}
++	c = (const struct qrtr_ctrl *)(const void *)(p + hlen);
++
++	switch (type) {
++	case QRTR_TYPE_HELLO:
++		q_modem_node = src_node;
++		q_hello_rx = TRUE;
++		q_hello_sent = FALSE;
++		printf("SWEET WLAN: qrtr v%u HELLO from node %u\n", q_ver,
++		    src_node);
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		if (size < sizeof(*c)) {
++			break;
++		}
++		printf("SWEET WLAN: service %x:%x node %u port %x %s\n",
++		    c->a, c->b, c->c, c->d, wlan_svc_name(c->a));
++		if (c->a == QMI_SVC_WLFW) {
++			printf("SWEET WLAN: *** WLFW 0x45 up: node %u port "
++			    "%x ***\n", c->c, c->d);
++			q_wlfw_seen = TRUE;
++		}
++		break;
++	case QRTR_TYPE_DATA:
++		if (confirm) {
++			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX,
++				QRTR_NODE_APPS, dst_port, 0, 0 };
++
++			wlan_qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node,
++			    src_port, &r, sizeof(r));
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static boolean_t
++wlan_rx_one(void)
++{
++	struct glink_msg m;
++	uint32_t avail = wlan_rx_avail(), n;
++
++	if (avail < sizeof(m)) {
++		return FALSE;
++	}
++	wlan_rx_peek(0, &m, sizeof(m));
++	g_rx_msgs++;
++	switch (m.cmd) {
++	case CMD_VERSION:
++		wlan_rx_advance(8);
++		printf("SWEET WLAN: glink VERSION %u features %x\n", m.p1,
++		    m.p2);
++		if (m.p1 != 0) {
++			g_features &= m.p2;
++			wlan_glink_cmd(CMD_VERSION_ACK, 1, g_features);
++		}
++		break;
++	case CMD_VERSION_ACK:
++		wlan_rx_advance(8);
++		printf("SWEET WLAN: glink VERSION_ACK %u features %x\n", m.p1,
++		    m.p2);
++		if (m.p1 != 0 && m.p2 != g_features) {
++			g_features &= m.p2;
++			wlan_glink_cmd(CMD_VERSION, 1, g_features);
++		}
++		break;
++	case CMD_OPEN: {
++		char name[33] = {};
++
++		n = (8 + m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return FALSE;
++		}
++		wlan_rx_peek(8, name, MIN(m.p2, 32u));
++		wlan_rx_advance(n);
++		printf("SWEET WLAN: glink modem OPEN \"%s\" rcid %u\n", name,
++		    m.p1);
++		if (wlan_name_eq(name, GLINK_CHAN_NAME)) {
++			g_rcid = m.p1;
++			g_remote_open = TRUE;
++			wlan_glink_cmd(CMD_OPEN_ACK, (uint16_t)g_rcid, 0);
++			if (!g_open_sent) {
++				wlan_glink_open();
++			}
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		wlan_rx_advance(8);
++		printf("SWEET WLAN: glink OPEN_ACK lcid %u\n", m.p1);
++		if (m.p1 == GLINK_LCID) {
++			g_open_acked = TRUE;
++		}
++		break;
++	case CMD_CLOSE:
++		wlan_rx_advance(8);
++		printf("SWEET WLAN: glink modem CLOSE rcid %u\n", m.p1);
++		wlan_glink_cmd(CMD_CLOSE_ACK, m.p1, 0);
++		if (m.p1 == g_rcid) {
++			g_remote_open = FALSE;
++		}
++		break;
++	case CMD_INTENT:
++		n = (8 + 8 * m.p2 + 7) & ~7u;
++		if (avail < n) {
++			return FALSE;
++		}
++		for (uint32_t i = 0; i < m.p2; i++) {
++			uint32_t pair[2];
++
++			wlan_rx_peek(8 + 8 * i, pair, 8);
++			if (m.p1 == g_rcid &&
++			    g_ri_count < GLINK_MAX_INTENTS) {
++				g_ri[g_ri_count].size = pair[0];
++				g_ri[g_ri_count].id = pair[1];
++				g_ri[g_ri_count].used = FALSE;
++				g_ri_count++;
++			}
++		}
++		wlan_rx_advance(n);
++		g_intent_req_sent = FALSE;
++		break;
++	case CMD_RX_DONE:
++	case CMD_RX_DONE_W_REUSE:
++		wlan_rx_advance(8);
++		for (unsigned i = 0; i < g_ri_count; i++) {
++			if (g_ri[i].id == m.p2) {
++				if (m.cmd == CMD_RX_DONE_W_REUSE) {
++					g_ri[i].used = FALSE;
++				} else {
++					g_ri[i] = g_ri[--g_ri_count];
++				}
++				break;
++			}
++		}
++		break;
++	case CMD_RX_INTENT_REQ:
++		wlan_rx_advance(8);
++		wlan_glink_intents(1, MAX(m.p2, GLINK_INTENT_SIZE));
++		wlan_glink_cmd(CMD_RX_INTENT_REQ_ACK, GLINK_LCID, 1);
++		break;
++	case CMD_RX_INTENT_REQ_ACK:
++		wlan_rx_advance(8);
++		if (m.p2 == 0) {
++			g_intent_req_sent = FALSE;
++		}
++		break;
++	case CMD_CLOSE_ACK:
++	case CMD_SIGNALS:
++		wlan_rx_advance(8);
++		break;
++	case CMD_READ_NOTIF:
++		wlan_rx_advance(8);
++		if (apcs != 0) {
++			*(volatile uint32_t *)(apcs + APCS_IPC_OFF) =
++			    1u << GLINK_IRQ_BIT;
++		}
++		wlan_mb();
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		uint32_t hdr[2];
++
++		if (avail < 16) {
++			return FALSE;
++		}
++		wlan_rx_peek(8, hdr, 8);
++		n = (16 + hdr[0] + 7) & ~7u;
++		if (avail < n) {
++			return FALSE;
++		}
++		if (m.cmd == CMD_TX_DATA) {
++			g_asm_len = 0;
++		}
++		if (g_asm_len + hdr[0] <= sizeof(g_asm)) {
++			wlan_rx_peek(16, g_asm + g_asm_len, hdr[0]);
++			g_asm_len += hdr[0];
++		}
++		wlan_rx_advance(n);
++		if (hdr[1] == 0) {
++			if (m.p1 == g_rcid) {
++				wlan_qrtr_rx(g_asm, g_asm_len);
++			}
++			if (g_features & 1) {
++				wlan_glink_cmd(CMD_RX_DONE_W_REUSE,
++				    GLINK_LCID, m.p2);
++			} else {
++				wlan_glink_cmd(CMD_RX_DONE, GLINK_LCID, m.p2);
++				wlan_glink_intents(1, GLINK_INTENT_SIZE);
++			}
++		}
++		break;
++	}
++	default:
++		printf("SWEET WLAN: glink unknown cmd %u (%x %x)\n", m.cmd,
++		    m.p1, m.p2);
++		g_rx = NULL;
++		return FALSE;
++	}
++	return TRUE;
++}
++
++static void
++wlan_glink_poll(unsigned ms)
++{
++	g_ms = ms;
++	if (g_rx == NULL && g_part != NULL) {
++		uint32_t sz = 0;
++
++		g_rx = (uint8_t *)wlan_f2_item(g_part, ITEM_GLINK_RX, &sz);
++		if (g_rx != NULL) {
++			g_rx_len = sz;
++			printf("SWEET WLAN: glink modem RX FIFO %u bytes\n",
++			    sz);
++		}
++	}
++	for (int i = 0; i < 64 && g_rx != NULL && wlan_rx_one(); i++) {
++	}
++	if (q_pending_len != 0) {
++		unsigned i;
++
++		for (i = 0; i < g_ri_count; i++) {
++			if (!g_ri[i].used && g_ri[i].size >= q_pending_len) {
++				break;
++			}
++		}
++		if (i < g_ri_count) {
++			struct glink_data_hdr h = { { CMD_TX_DATA,
++			    GLINK_LCID, g_ri[i].id }, q_pending_len, 0 };
++
++			g_ri[i].used = TRUE;
++			if (wlan_tx_write(&h, sizeof(h), q_pending,
++			    q_pending_len)) {
++				q_pending_len = 0;
++			} else {
++				g_ri[i].used = FALSE;
++			}
++		} else if (!g_intent_req_sent) {
++			wlan_glink_cmd(CMD_RX_INTENT_REQ, GLINK_LCID,
++			    q_pending_len);
++			g_intent_req_sent = TRUE;
++		}
++	}
++	if (wlan_chan_up() && !g_intents_sent) {
++		wlan_glink_intents(GLINK_OUR_INTENTS, GLINK_INTENT_SIZE);
++		g_intents_sent = TRUE;
++		printf("SWEET WLAN: t=%u ms IPCRTR open, %u intents sent\n", ms,
++		    GLINK_OUR_INTENTS);
++	}
++	if (wlan_chan_up() && !q_hello_sent) {
++		struct qrtr_ctrl c = { QRTR_TYPE_HELLO, 0, 0, 0, 0 };
++
++		wlan_qrtr_send(QRTR_TYPE_HELLO, QRTR_PORT_CTRL, q_modem_node,
++		    QRTR_PORT_CTRL, &c, sizeof(c));
++		q_hello_sent = TRUE;
++		printf("SWEET WLAN: t=%u ms sent qrtr HELLO to node %x\n", ms,
++		    q_modem_node);
++	}
++	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
++		printf("SWEET WLAN: t=%u ms modem did not open IPCRTR, "
++		    "opening it\n", ms);
++		wlan_glink_open();
++	}
++}
++
++static boolean_t
++wlan_glink_start(struct smem_part_hdr *part)
++{
++	uint32_t *desc;
++	uint32_t sz = 0;
++
++	g_part = part;
++	desc = (uint32_t *)wlan_smem_alloc(part, ITEM_GLINK_DESC, 32);
++	if (desc == NULL) {
++		printf("SWEET WLAN: glink descriptor allocation failed\n");
++		return FALSE;
++	}
++	g_desc = desc;
++	g_tx = (uint8_t *)wlan_smem_alloc(part, ITEM_GLINK_TX, GLINK_TX_SIZE);
++	if (g_tx == NULL) {
++		printf("SWEET WLAN: glink TX FIFO allocation failed\n");
++		return FALSE;
++	}
++	g_rx = (uint8_t *)wlan_f2_item(part, ITEM_GLINK_RX, &sz);
++	if (g_rx != NULL) {
++		g_rx_len = sz;
++	}
++	printf("SWEET WLAN: glink desc before %08x %08x %08x %08x\n", desc[0],
++	    desc[1], desc[2], desc[3]);
++	desc[1] = 0;                            /* tx head */
++	desc[2] = 0;                            /* rx tail */
++	wlan_mb();
++	printf("SWEET WLAN: glink up: tx %08x, rx %s (%u bytes)\n",
++	    (uint32_t)(vm_offset_t)g_tx, g_rx != NULL ? "ready" : "wait", sz);
++	wlan_glink_cmd(CMD_VERSION, 1, g_features);
++	return TRUE;
++}
++
+ /* Called by the modem thread after AUTH_COMPLETE, only for sweetwlan>=2. */
+ void
+ lavender_wlan_after_modem(void)
+@@ -835,6 +1498,22 @@ lavender_wlan_after_modem(void)
+ 		}
+ 		printf("SWEET WLAN: SMP2P watch done, slave-kernel %08x %s\n",
+ 		    sk_last, ready ? "READY" : "not ready");
++		if (ready) {
++			if (wlan_glink_start(part)) {
++				for (i2 = 0; i2 < 30000; i2++) {
++					wlan_glink_poll(i2);
++					if (q_wlfw_seen) {
++						break;
++					}
++					wlan_wait(1);
++				}
++				printf("SWEET WLAN: glink summary rx %u tx %u "
++				    "chan %s intents %u, qrtr node %x hello %u "
++				    "wlfw %u\n", g_rx_msgs, g_tx_msgs,
++				    wlan_chan_up() ? "UP" : "down", g_ri_count,
++				    q_modem_node, q_hello_rx, q_wlfw_seen);
++			}
++		}
+ 	}
+ 	printf("SWEET WLAN: F2 probe done\n");
+ }
