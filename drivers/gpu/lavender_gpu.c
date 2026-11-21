@@ -2012,8 +2012,12 @@ step21_draw(void)
 
 	lav_announce("step 21: submit the first 3D draw");
 	/* fd5_emit_restore (the non-default part) */
-	ring_pkt7(CP_SET_RENDER_MODE, 1);
+	ring_pkt7(CP_SET_RENDER_MODE, 5);
 	ring_put(1);						/* BYPASS */
+	ring_put(0);
+	ring_put(0);
+	ring_put(0);
+	ring_put(0);
 	if (draw_mark("bypass")) {
 		return;
 	}
