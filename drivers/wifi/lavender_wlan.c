@@ -47,11 +47,15 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
+#include <libkern/libkern.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+extern int lavender_modem_fw_size(const char *name, uint32_t *size);
+extern int lavender_modem_fw_read(const char *name, uint32_t off, void *dst,
+    uint32_t len);
 
 #define GCC_PA          0x00100000u
 #define GCC_SIZE        0x94000u
@@ -757,9 +761,28 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
 #define QRTR_NODE_BCAST   0xffffffffu
 #define QRTR_TYPE_DATA    1
 #define QRTR_TYPE_HELLO   2
+#define QRTR_TYPE_NEW_LOOKUP 3
 #define QRTR_TYPE_NEW_SERVER 4
 #define QRTR_TYPE_RESUME_TX 7
 #define QMI_SVC_WLFW      0x45
+
+/*
+ * Host services (topaz layout): the modem's elf loader fetches
+ * /readonly/firmware/image/<file> through the AP tftp server announced on
+ * QRTR service 4096. Sessions live on 0x4100 + slot.
+ */
+#define TFTP_SVC          4096
+#define PORT_TFTP         0x4002
+#define PORT_SESS_BASE    0x4100
+#define TFTP_MAX_SESS     8
+#define TFTP_BLK          16384
+
+#define TFTP_RRQ          1
+#define TFTP_WRQ          2
+#define TFTP_DATA         3
+#define TFTP_ACK          4
+#define TFTP_ERROR        5
+#define TFTP_OACK         6
 
 struct glink_msg {
 	uint16_t cmd, p1;
@@ -798,8 +821,8 @@ static uint8_t g_asm[GLINK_INTENT_SIZE];
 static uint32_t g_asm_len;
 static uint32_t q_ver = 1, q_modem_node = QRTR_NODE_BCAST;
 static boolean_t q_hello_sent, q_hello_rx, q_wlfw_seen;
-static uint8_t q_tx[512];
-static uint8_t q_pending[256];
+static uint8_t q_tx[4 + TFTP_BLK + 80];
+static uint8_t q_pending[4 + TFTP_BLK + 80];
 static uint32_t q_pending_len;
 static unsigned g_ms, g_tx_msgs, g_rx_msgs;
 static uint32_t g_last_desc[4];
@@ -1053,6 +1076,273 @@ wlan_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node,
 	(void)wlan_glink_send(q_tx, total);
 }
 
+/* --- F2 step 5: tftp host service (firmware files) ----------------------- */
+
+struct tftp_sess {
+	boolean_t used, last;
+	uint32_t node, port, rport, size, blk, sent;
+	char name[13];
+};
+
+static struct tftp_sess t_sess[TFTP_MAX_SESS];
+static uint8_t t_pkt[4 + TFTP_BLK];
+
+static void
+wlan_tftp_reply(struct tftp_sess *s, uint32_t n)
+{
+	wlan_qrtr_send(QRTR_TYPE_DATA, s->port, s->node, s->rport, t_pkt, n);
+}
+
+static void
+wlan_tftp_error(struct tftp_sess *s, uint16_t code, const char *msg)
+{
+	uint32_t n = 4;
+
+	t_pkt[0] = 0;
+	t_pkt[1] = TFTP_ERROR;
+	t_pkt[2] = (uint8_t)(code >> 8);
+	t_pkt[3] = (uint8_t)code;
+	for (uint32_t i = 0; msg[i] != 0 && n + 1 < sizeof(t_pkt); i++) {
+		t_pkt[n++] = (uint8_t)msg[i];
+	}
+	t_pkt[n++] = 0;
+	wlan_tftp_reply(s, n);
+}
+
+static void
+wlan_tftp_data(struct tftp_sess *s, uint32_t block)
+{
+	uint32_t off = (block - 1) * s->blk;
+	uint32_t n = 0;
+	int r;
+
+	if (off < s->size) {
+		r = lavender_modem_fw_read(s->name, off, t_pkt + 4, s->blk);
+		if (r < 0) {
+			printf("SWEET WLAN: tftp %s read %u failed %d\n", s->name,
+			    off, r);
+			wlan_tftp_error(s, 2, "read error");
+			s->used = FALSE;
+			return;
+		}
+		n = (uint32_t)r;
+	}
+	t_pkt[0] = 0;
+	t_pkt[1] = TFTP_DATA;
+	t_pkt[2] = (uint8_t)(block >> 8);
+	t_pkt[3] = (uint8_t)block;
+	s->sent = block;
+	s->last = n < s->blk;
+	wlan_tftp_reply(s, 4 + n);
+}
+
+/* /readonly/firmware/image/wlanmdsp.mbn -> WLANMDSP.MBN (8.3, uppercase). */
+static boolean_t
+wlan_tftp_fname(const char *path, char *out, size_t max)
+{
+	const char *base = path;
+	size_t k = 0;
+
+	for (const char *p = path; *p != 0; p++) {
+		if (*p == '/') {
+			base = p + 1;
+		}
+	}
+	if (*base == 0) {
+		return FALSE;
+	}
+	for (; *base != 0 && k + 1 < max; base++) {
+		char c = *base;
+
+		if (c >= 'a' && c <= 'z') {
+			c = (char)(c - 'a' + 'A');
+		}
+		out[k++] = c;
+	}
+	out[k] = 0;
+	return TRUE;
+}
+
+static void
+wlan_tftp_u32(uint8_t *p, uint32_t *n, uint32_t v)
+{
+	char tmp[12];
+	int l = 0;
+
+	do {
+		tmp[l++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v != 0);
+	while (l > 0) {
+		p[(*n)++] = (uint8_t)tmp[--l];
+	}
+}
+
+static void
+wlan_tftp_req(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+{
+	struct tftp_sess *s = NULL;
+	char path[96], name[13];
+	uint32_t o = 2;
+	boolean_t opts = FALSE;
+	uint16_t op;
+
+	if (len < 4) {
+		return;
+	}
+	op = (uint16_t)((d[0] << 8) | d[1]);
+	if (op != TFTP_RRQ && op != TFTP_WRQ) {
+		return;
+	}
+	{
+		uint32_t i = 0;
+
+		while (o < len && d[o] != 0 && i + 1 < sizeof(path)) {
+			path[i++] = (char)d[o++];
+		}
+		path[i] = 0;
+		o++;                            /* NUL */
+		while (o < len && d[o] != 0) {
+			o++;                    /* transfer mode */
+		}
+		o++;
+	}
+	if (!wlan_tftp_fname(path, name, sizeof(name))) {
+		return;
+	}
+	for (unsigned i = 0; i < TFTP_MAX_SESS; i++) {
+		/* A retrying client reuses its own slot, then the first free one. */
+		if (t_sess[i].used && t_sess[i].node == node &&
+		    t_sess[i].rport == port) {
+			s = &t_sess[i];
+			break;
+		}
+		if (!t_sess[i].used && s == NULL) {
+			s = &t_sess[i];
+		}
+	}
+	if (s == NULL) {
+		printf("SWEET WLAN: tftp no free session for %s\n", name);
+		return;
+	}
+	memset(s, 0, sizeof(*s));
+	s->node = node;
+	s->rport = port;
+	s->port = PORT_SESS_BASE + (uint32_t)(s - t_sess);
+	memcpy(s->name, name, sizeof(s->name));
+	s->blk = 512;
+	while (o + 1 < len) {
+		char key[24];
+		uint32_t i = 0, v = 0;
+
+		while (o < len && d[o] != 0 && i + 1 < sizeof(key)) {
+			key[i++] = (char)d[o++];
+		}
+		key[i] = 0;
+		o++;
+		while (o < len && d[o] != 0) {
+			if (d[o] >= '0' && d[o] <= '9') {
+				v = v * 10 + (uint32_t)(d[o] - '0');
+			}
+			o++;
+		}
+		o++;
+		if (key[0] == 0) {
+			break;
+		}
+		opts = TRUE;
+		if (strcasecmp(key, "blksize") == 0 && v >= 8 && v <= TFTP_BLK) {
+			s->blk = v;
+		}
+	}
+	if (op == TFTP_WRQ) {
+		printf("SWEET WLAN: tftp WRQ %s refused\n", name);
+		s->used = TRUE;
+		wlan_tftp_error(s, 2, "read only");
+		s->used = FALSE;
+		return;
+	}
+	{
+		int r = lavender_modem_fw_size(name, &s->size);
+
+		if (r != 0) {
+			printf("SWEET WLAN: tftp RRQ %s not found (%d)\n", name, r);
+			s->used = TRUE;
+			wlan_tftp_error(s, 1, "not found");
+			s->used = FALSE;
+			return;
+		}
+	}
+	s->used = TRUE;
+	printf("SWEET WLAN: tftp RRQ %s (%u bytes, blk %u%s) port %x\n",
+	    s->name, s->size, s->blk, opts ? ", oack" : "", s->port);
+	if (opts) {
+		uint32_t n = 4;
+		const char *k = "blksize";
+
+		t_pkt[0] = 0;
+		t_pkt[1] = TFTP_OACK;
+		while (*k != 0) {
+			t_pkt[n++] = (uint8_t)*k++;
+		}
+		t_pkt[n++] = 0;
+		wlan_tftp_u32(t_pkt, &n, s->blk);
+		t_pkt[n++] = 0;
+		k = "tsize";
+		while (*k != 0) {
+			t_pkt[n++] = (uint8_t)*k++;
+		}
+		t_pkt[n++] = 0;
+		wlan_tftp_u32(t_pkt, &n, s->size);
+		t_pkt[n++] = 0;
+		wlan_tftp_reply(s, n);
+	} else {
+		wlan_tftp_data(s, 1);
+	}
+}
+
+static void
+wlan_tftp_sess_rx(uint32_t port, const uint8_t *d, uint32_t len)
+{
+	struct tftp_sess *s = NULL;
+	uint16_t op, block;
+
+	for (unsigned i = 0; i < TFTP_MAX_SESS; i++) {
+		if (t_sess[i].used && t_sess[i].port == port) {
+			s = &t_sess[i];
+			break;
+		}
+	}
+	if (s == NULL || len < 4) {
+		return;
+	}
+	op = (uint16_t)((d[0] << 8) | d[1]);
+	block = (uint16_t)((d[2] << 8) | d[3]);
+	switch (op) {
+	case TFTP_ACK:
+		if (block == 0) {
+			wlan_tftp_data(s, 1);
+		} else if (block + 1 == s->sent) {
+			wlan_tftp_data(s, s->sent);     /* repeat a lost DATA */
+		} else if (block == s->sent) {
+			if (s->last) {
+				printf("SWEET WLAN: tftp %s done (%u bytes)\n",
+				    s->name, s->size);
+				s->used = FALSE;
+			} else {
+				wlan_tftp_data(s, s->sent + 1);
+			}
+		}
+		break;
+	case TFTP_ERROR:
+		printf("SWEET WLAN: tftp %s peer error %u\n", s->name, block);
+		s->used = FALSE;
+		break;
+	default:
+		break;
+	}
+}
+
 /* --- F2 step 4: QMI servreg-locator (pd-mapper) ------------------------- */
 
 #define QMI_REQ   0
@@ -1237,11 +1527,17 @@ wlan_svc_announce(void)
 {
 	struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, 0x40, 0x101,
 	    QRTR_NODE_APPS, PORT_PDM };
+	struct qrtr_ctrl t = { QRTR_TYPE_NEW_SERVER, TFTP_SVC, 1,
+	    QRTR_NODE_APPS, PORT_TFTP };
 
 	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
 	    QRTR_PORT_CTRL, &c, sizeof(c));
 	printf("SWEET WLAN: announced pd-mapper 0x40:0x101 port %x\n",
 	    PORT_PDM);
+	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
+	    QRTR_PORT_CTRL, &t, sizeof(t));
+	printf("SWEET WLAN: announced tftp %u:1 port %x\n", TFTP_SVC,
+	    PORT_TFTP);
 }
 
 static boolean_t
@@ -1250,6 +1546,15 @@ wlan_svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port,
 {
 	uint16_t txn, msg;
 
+	if (dst_port == PORT_TFTP) {
+		wlan_tftp_req(src_node, src_port, d, len);
+		return TRUE;
+	}
+	if (dst_port >= PORT_SESS_BASE &&
+	    dst_port < PORT_SESS_BASE + TFTP_MAX_SESS) {
+		wlan_tftp_sess_rx(dst_port, d, len);
+		return TRUE;
+	}
 	if (dst_port != PORT_PDM || len < 7 || d[0] != QMI_REQ) {
 		return FALSE;
 	}
@@ -1306,6 +1611,11 @@ wlan_qrtr_rx(const uint8_t *p, uint32_t len)
 		q_hello_sent = FALSE;
 		printf("SWEET WLAN: qrtr v%u HELLO from node %u\n", q_ver,
 		    src_node);
+		break;
+	case QRTR_TYPE_NEW_LOOKUP:
+		printf("SWEET WLAN: qrtr lookup from node %u, re-announcing\n",
+		    src_node);
+		wlan_svc_announce();
 		break;
 	case QRTR_TYPE_NEW_SERVER:
 		if (size < sizeof(*c)) {

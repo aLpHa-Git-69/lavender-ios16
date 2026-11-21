@@ -743,6 +743,62 @@ fat_read_to_buf(const char *name, void *dst, uint32_t max, uint32_t *out)
 }
 
 /*
+ * Firmware files for the AP's tftp host service (0721). The modem's elf
+ * loader asks for /readonly/firmware/image/wlanmdsp.mbn by basename; the
+ * modem FAT's IMAGE/ directory is already cached in fat_image.
+ */
+int
+lavender_modem_fw_size(const char *name, uint32_t *size)
+{
+	uint32_t cluster;
+
+	return fat_lookup(name, &cluster, size);
+}
+
+int
+lavender_modem_fw_read(const char *name, uint32_t off, void *dst, uint32_t len)
+{
+	uint32_t cluster, size, pos = 0, done = 0;
+	int err;
+
+	err = fat_lookup(name, &cluster, &size);
+	if (err) {
+		return err;
+	}
+	if (off >= size) {
+		return 0;
+	}
+	len = MIN(len, size - off);
+	while (pos < off) {
+		cluster = fat_next(cluster);
+		if (cluster < 2 || cluster >= FAT_MAX_CLUSTER) {
+			return EIO;
+		}
+		pos += fat_cluster_bytes;
+	}
+	while (done < len) {
+		uint32_t in = (off + done) - pos;
+		uint32_t n = MIN(len - done, fat_cluster_bytes - in);
+
+		err = emmc_read(MODEM_LBA + fat_cluster_sector(cluster), fat_spc,
+		    bounce);
+		if (err) {
+			return err;
+		}
+		memcpy((uint8_t *)dst + done, (uint8_t *)bounce + in, n);
+		done += n;
+		if (done < len) {
+			cluster = fat_next(cluster);
+			if (cluster < 2 || cluster >= FAT_MAX_CLUSTER) {
+				return EIO;
+			}
+			pos += fat_cluster_bytes;
+		}
+	}
+	return (int)done;
+}
+
+/*
  * Stream one segment blob; its directory size must match p_filesz. The blob
  * is copied into the modem carve-out through IO_CHUNK windows.
  */
