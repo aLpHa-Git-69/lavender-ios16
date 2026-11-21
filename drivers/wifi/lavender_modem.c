@@ -221,6 +221,9 @@ io_copy(vm_offset_t dst, const void *src, uint32_t n)
  * io_submap, whose parent entry is permanent, so ml_io_unmap() cannot
  * release it. pmap_remove() wants page-aligned bounds: unmap from
  * trunc_page(va) with round_page(offset + length).
+ *
+ * 0710 keeps that mapping and adds one trace per window and per MiB: the
+ * 0709 v2 boot stopped inside B05 without a line after blob 04.
  */
 static int
 io_zero_pa(uint32_t pa, uint32_t n)
@@ -734,6 +737,7 @@ fat_read_blob(const char *name, uint32_t pa, uint32_t want)
 	vm_offset_t va = 0;
 	int err;
 
+	printf("SWEET MODEM: %s lookup\n", name);
 	err = fat_lookup(name, &cluster, &size);
 	if (err) {
 		printf("SWEET MODEM: %s not found\n", name);
@@ -753,15 +757,22 @@ fat_read_blob(const char *name, uint32_t pa, uint32_t want)
 				    round_page(va - trunc_page(va) + win));
 			}
 			win = MIN(size - off, IO_CHUNK);
+			printf("SWEET MODEM: %s window %08x+%x\n", name,
+			    pa + off, win);
 			va = ml_io_map_unmappable(pa + off, win, VM_WIMG_IO);
 			if (va == 0) {
 				printf("SWEET MODEM: %s map failed at %u\n",
 				    name, off);
 				return ENOMEM;
 			}
+			printf("SWEET MODEM: %s mapped va %08x\n", name,
+			    (uint32_t)va);
 			used = 0;
 		}
 		n = MIN(size - off, fat_cluster_bytes);
+		if (used == 0 || (used & 0xffff) == 0) {
+			printf("SWEET MODEM: %s read %u/%u\n", name, off, size);
+		}
 		err = emmc_read(MODEM_LBA + fat_cluster_sector(cluster),
 		    fat_spc, bounce);
 		if (err) {
@@ -1107,12 +1118,16 @@ modem_load_segments(void)
 		}
 		if (filesz != 0) {
 			snprintf(name, sizeof(name), "MODEM.B%02u", i);
+			printf("SWEET MODEM: loading %s at %08x (%u)\n", name,
+			    paddr, filesz);
 			err = fat_read_blob(name, paddr, filesz);
 			if (err) {
 				return err;
 			}
 		}
 		if (memsz > filesz) {
+			printf("SWEET MODEM: blob %02u zero %08x+%x\n", i,
+			    paddr + filesz, memsz - filesz);
 			err = io_zero_pa(paddr + filesz, memsz - filesz);
 			if (err) {
 				return err;
