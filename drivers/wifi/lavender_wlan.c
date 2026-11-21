@@ -134,9 +134,11 @@ struct smp2p_entry {
 #define WLAN_SID0               0x1a00u
 #define WLAN_SID1               0x1a01u
 
-static vm_offset_t gcc, smmu, smem, msa;
+static vm_offset_t gcc, smmu, smem, msa, apcs;
 static int wlan_chan;
 static uint32_t wlan_mode;
+
+void lavender_wlan_after_modem(void);
 
 static inline uint32_t
 wlan_rd(vm_offset_t base, uint32_t off)
@@ -410,7 +412,8 @@ wlan_f2_items(struct smem_part_hdr *p)
 		printf("SWEET WLAN: item %u size %u pad %u/%u\n", h->item,
 		    h->size, h->pad_data, h->pad_hdr);
 		if (h->item == ITEM_GLINK_DESC && h->size >= 32) {
-			uint32_t *d = (uint32_t *)(e + sizeof(*h) + h->pad_hdr);
+			uint32_t *d = (uint32_t *)(void *)(e + sizeof(*h) +
+			    h->pad_hdr);
 
 			printf("SWEET WLAN: glink desc %08x %08x %08x %08x "
 			    "%08x %08x %08x %08x\n", d[0], d[1], d[2], d[3],
@@ -428,7 +431,7 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
 {
 	uint32_t size = 0, total, avail, i;
 	struct smp2p_hdr *h;
-	struct smp2p_entry *e;
+	struct smp2p_entry *ent;
 
 	h = (struct smp2p_hdr *)wlan_f2_item(p, item, &size);
 	if (h == NULL) {
@@ -448,21 +451,21 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
 		return;
 	}
 	total = h->total;
-	avail = (size - sizeof(*h)) / sizeof(*e);
+	avail = (size - sizeof(*h)) / sizeof(*ent);
 	if (total > avail) {
 		total = avail;
 	}
 	if (total > 16) {
 		total = 16;
 	}
-	e = (struct smp2p_entry *)(h + 1);
+	ent = (struct smp2p_entry *)(h + 1);
 	for (i = 0; i < total; i++) {
 		char name[17];
 
-		memcpy(name, e[i].name, 16);
+		memcpy(name, ent[i].name, 16);
 		name[16] = 0;
 		printf("SWEET WLAN: smp2p %s[%u] %s = %08x\n", label, i, name,
-		    e[i].value);
+		    ent[i].value);
 	}
 }
 
@@ -488,11 +491,12 @@ lavender_wlan_after_modem(void)
 		printf("SWEET WLAN: APCS map failed\n");
 	}
 
-	wlan_f2_toc(smem);
+	wlan_f2_toc((uint8_t *)smem);
 
 	/* The modem creates its SMEM items while it boots; wait for SMP2P IN. */
 	for (i = 0; i < 60; i++) {
-		part = wlan_f2_partition(smem, SMEM_HOST_GLOBAL, SMEM_HOST_GLOBAL);
+		part = wlan_f2_partition((uint8_t *)smem, SMEM_HOST_GLOBAL,
+		    SMEM_HOST_GLOBAL);
 		if (part != NULL && wlan_f2_item(part, ITEM_SMP2P_IN, &size)) {
 			break;
 		}
@@ -504,7 +508,7 @@ lavender_wlan_after_modem(void)
 		return;
 	}
 	printf("SWEET WLAN: GLOBAL partition off %05x after %u ms\n",
-	    (uint32_t)((uint8_t *)part - smem), i * 500);
+	    (uint32_t)((uint8_t *)part - (uint8_t *)smem), i * 500);
 	wlan_f2_items(part);
 	wlan_f2_smp2p(part, ITEM_SMP2P_OUT, "out");
 	wlan_f2_smp2p(part, ITEM_SMP2P_IN, "in");

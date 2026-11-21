@@ -22,7 +22,7 @@ index d5c05b1..858d5a4 100644
  		}
  	}
 diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
-index 49a79aa..adcd971 100644
+index 49a79aa..bccfb86 100644
 --- a/bsd/dev/lavender_wlan.c
 +++ b/bsd/dev/lavender_wlan.c
 @@ -1,9 +1,11 @@
@@ -129,15 +129,20 @@ index 49a79aa..adcd971 100644
  /* GCC byte offsets from GCC_PA (gcc-sdm660.c) */
  #define GCC_MSS_CFG_AHB         0x8a000u
  #define GCC_MSS_MNOC_BIMC_AXI   0x8a004u
-@@ -80,6 +136,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -78,8 +134,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define WLAN_SID0               0x1a00u
+ #define WLAN_SID1               0x1a01u
  
- static vm_offset_t gcc, smmu, smem, msa;
+-static vm_offset_t gcc, smmu, smem, msa;
++static vm_offset_t gcc, smmu, smem, msa, apcs;
  static int wlan_chan;
 +static uint32_t wlan_mode;
++
++void lavender_wlan_after_modem(void);
  
  static inline uint32_t
  wlan_rd(vm_offset_t base, uint32_t off)
-@@ -220,6 +277,246 @@ wlan_region(const char *name, vm_offset_t base, uint32_t size)
+@@ -220,6 +279,248 @@ wlan_region(const char *name, vm_offset_t base, uint32_t size)
  	}
  }
  
@@ -274,7 +279,8 @@ index 49a79aa..adcd971 100644
 +		printf("SWEET WLAN: item %u size %u pad %u/%u\n", h->item,
 +		    h->size, h->pad_data, h->pad_hdr);
 +		if (h->item == ITEM_GLINK_DESC && h->size >= 32) {
-+			uint32_t *d = (uint32_t *)(e + sizeof(*h) + h->pad_hdr);
++			uint32_t *d = (uint32_t *)(void *)(e + sizeof(*h) +
++			    h->pad_hdr);
 +
 +			printf("SWEET WLAN: glink desc %08x %08x %08x %08x "
 +			    "%08x %08x %08x %08x\n", d[0], d[1], d[2], d[3],
@@ -292,7 +298,7 @@ index 49a79aa..adcd971 100644
 +{
 +	uint32_t size = 0, total, avail, i;
 +	struct smp2p_hdr *h;
-+	struct smp2p_entry *e;
++	struct smp2p_entry *ent;
 +
 +	h = (struct smp2p_hdr *)wlan_f2_item(p, item, &size);
 +	if (h == NULL) {
@@ -312,21 +318,21 @@ index 49a79aa..adcd971 100644
 +		return;
 +	}
 +	total = h->total;
-+	avail = (size - sizeof(*h)) / sizeof(*e);
++	avail = (size - sizeof(*h)) / sizeof(*ent);
 +	if (total > avail) {
 +		total = avail;
 +	}
 +	if (total > 16) {
 +		total = 16;
 +	}
-+	e = (struct smp2p_entry *)(h + 1);
++	ent = (struct smp2p_entry *)(h + 1);
 +	for (i = 0; i < total; i++) {
 +		char name[17];
 +
-+		memcpy(name, e[i].name, 16);
++		memcpy(name, ent[i].name, 16);
 +		name[16] = 0;
 +		printf("SWEET WLAN: smp2p %s[%u] %s = %08x\n", label, i, name,
-+		    e[i].value);
++		    ent[i].value);
 +	}
 +}
 +
@@ -352,11 +358,12 @@ index 49a79aa..adcd971 100644
 +		printf("SWEET WLAN: APCS map failed\n");
 +	}
 +
-+	wlan_f2_toc(smem);
++	wlan_f2_toc((uint8_t *)smem);
 +
 +	/* The modem creates its SMEM items while it boots; wait for SMP2P IN. */
 +	for (i = 0; i < 60; i++) {
-+		part = wlan_f2_partition(smem, SMEM_HOST_GLOBAL, SMEM_HOST_GLOBAL);
++		part = wlan_f2_partition((uint8_t *)smem, SMEM_HOST_GLOBAL,
++		    SMEM_HOST_GLOBAL);
 +		if (part != NULL && wlan_f2_item(part, ITEM_SMP2P_IN, &size)) {
 +			break;
 +		}
@@ -368,7 +375,7 @@ index 49a79aa..adcd971 100644
 +		return;
 +	}
 +	printf("SWEET WLAN: GLOBAL partition off %05x after %u ms\n",
-+	    (uint32_t)((uint8_t *)part - smem), i * 500);
++	    (uint32_t)((uint8_t *)part - (uint8_t *)smem), i * 500);
 +	wlan_f2_items(part);
 +	wlan_f2_smp2p(part, ITEM_SMP2P_OUT, "out");
 +	wlan_f2_smp2p(part, ITEM_SMP2P_IN, "in");
@@ -384,7 +391,7 @@ index 49a79aa..adcd971 100644
  static void
  lavender_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
  {
-@@ -229,6 +526,10 @@ lavender_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -229,6 +530,10 @@ lavender_wlan_thread(__unused void *arg, __unused wait_result_t wr_)
  	if (delay_s > 300) {
  		delay_s = 300;
  	}
@@ -395,7 +402,7 @@ index 49a79aa..adcd971 100644
  	printf("SWEET WLAN: F0b platform probe in %u s\n", delay_s);
  	wlan_wait(delay_s * 1000);
  
-@@ -276,6 +577,7 @@ lavender_wlan_probe(void)
+@@ -276,6 +581,7 @@ lavender_wlan_probe(void)
  		return 0;
  	}
  	started = 1;
@@ -403,7 +410,7 @@ index 49a79aa..adcd971 100644
  	if (kernel_thread_start(lavender_wlan_thread, NULL, &thread) ==
  	    KERN_SUCCESS) {
  		thread_deallocate(thread);
-@@ -286,10 +588,16 @@ lavender_wlan_probe(void)
+@@ -286,10 +592,16 @@ lavender_wlan_probe(void)
  #else /* !ARM64_BOARD_CONFIG_LAVENDER */
  
  int lavender_wlan_probe(void);
