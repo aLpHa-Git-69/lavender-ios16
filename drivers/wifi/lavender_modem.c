@@ -176,16 +176,25 @@ mwr(vm_offset_t base, uint32_t off, uint32_t v)
  * 0247: ml_io_map() returns Device-nGnRnE memory. XNU's memset/bzero store
  * engine emits STNP (non-temporal) pairs, which are not safe on Device
  * memory: the 0246 boot wedged the modem thread inside the 1 MiB MBA zeroing
- * with no error line. Zero/copy with explicit volatile 64-bit stores.
+ * with no error line. Zero/copy with explicit volatile stores.
+ *
+ * 0711: Device memory also requires naturally aligned accesses. MODEM.B05 has
+ * an odd filesz, so its tail zero started at 0x8ac901d3 (offset 0x1d3) and
+ * the first 64-bit store wedged the thread after the "blob 05 zero" line.
+ * Touch single bytes until the destination is 8-byte aligned, then use
+ * 64-bit stores, then finish with single bytes.
  */
 static void
 io_zero(vm_offset_t dst, uint32_t n)
 {
-	volatile uint64_t *d = (volatile uint64_t *)dst;
-	uint32_t i;
+	uint32_t i = 0;
 
-	for (i = 0; i + 8 <= n; i += 8) {
-		*d++ = 0;
+	while (i < n && ((dst + i) & 7) != 0) {
+		*(volatile uint8_t *)(dst + i) = 0;
+		i++;
+	}
+	for (; i + 8 <= n; i += 8) {
+		*(volatile uint64_t *)(dst + i) = 0;
 	}
 	for (; i < n; i++) {
 		*(volatile uint8_t *)(dst + i) = 0;
@@ -197,14 +206,17 @@ static void
 io_copy(vm_offset_t dst, const void *src, uint32_t n)
 {
 	const uint8_t *s = src;
-	volatile uint64_t *d = (volatile uint64_t *)dst;
-	uint32_t i;
+	uint32_t i = 0;
 
-	for (i = 0; i + 8 <= n; i += 8) {
+	while (i < n && ((dst + i) & 7) != 0) {
+		*(volatile uint8_t *)(dst + i) = s[i];
+		i++;
+	}
+	for (; i + 8 <= n; i += 8) {
 		uint64_t v;
 
 		memcpy(&v, s + i, 8);
-		*d++ = v;
+		*(volatile uint64_t *)(dst + i) = v;
 	}
 	for (; i < n; i++) {
 		*(volatile uint8_t *)(dst + i) = s[i];
@@ -232,13 +244,16 @@ io_zero_pa(uint32_t pa, uint32_t n)
 
 	while (off < n) {
 		uint32_t chunk = MIN(n - off, IO_CHUNK);
-		vm_offset_t va = ml_io_map_unmappable(pa + off, chunk,
-		    VM_WIMG_IO);
+		vm_offset_t va;
 
+		printf("SWEET MODEM: zero window %08x+%x\n", pa + off, chunk);
+		va = ml_io_map_unmappable(pa + off, chunk, VM_WIMG_IO);
 		if (va == 0) {
 			return ENOMEM;
 		}
+		printf("SWEET MODEM: zero mapped va %08x\n", (uint32_t)va);
 		io_zero(va, chunk);
+		printf("SWEET MODEM: zero done\n");
 		ml_io_unmap(trunc_page(va),
 		    round_page(va - trunc_page(va) + chunk));
 		off += chunk;
