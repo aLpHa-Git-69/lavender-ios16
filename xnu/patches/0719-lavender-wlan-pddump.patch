@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
+index 2b79d07..b194729 100644
+--- a/bsd/dev/lavender_wlan.c
++++ b/bsd/dev/lavender_wlan.c
+@@ -1160,6 +1160,7 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
+ 	} map[] = {
+ 		{ "tms/servreg",       "msm/modem/root_pd" },
+ 		{ "tms/pdr_enabled",   "msm/modem/root_pd" },
++		{ "tms/pddump_disabled", "msm/modem/root_pd" },
+ 		{ "gps/gps_service",   "msm/modem/root_pd" },
+ 		{ "kernel/elf_loader", "msm/modem/wlan_pd" },
+ 		{ "tms/servreg",       "msm/modem/wlan_pd" },
+@@ -1178,6 +1179,10 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
+ 		wlan_qm_send(&m, PORT_PDM, node, port);
+ 		return;
+ 	}
++	printf("SWEET WLAN: pd-mapper raw %02x %02x %02x %02x %02x %02x "
++	    "%02x %02x %02x %02x %02x %02x %02x %02x len %u\n", d[0], d[1],
++	    d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
++	    d[12], d[13], len);
+ 	wlan_qm_string(d, len, 1, name, sizeof(name));
+ 	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+ 		if (wlan_streq(map[i].svc, name)) {
