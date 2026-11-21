@@ -1053,6 +1053,193 @@ wlan_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node,
 	(void)wlan_glink_send(q_tx, total);
 }
 
+/* --- F2 step 4: QMI servreg-locator (pd-mapper) ------------------------- */
+
+#define QMI_REQ   0
+#define QMI_RESP  2
+#define PORT_PDM  0x4001
+
+struct qmsg {
+	uint8_t b[512];
+	uint32_t n;
+};
+
+static boolean_t q_announced;
+static unsigned pd_reqs;
+
+static void
+wlan_qm_init(struct qmsg *m, uint16_t txn, uint16_t msg)
+{
+	m->b[0] = QMI_RESP;
+	memcpy(m->b + 1, &txn, 2);
+	memcpy(m->b + 3, &msg, 2);
+	m->n = 7;
+}
+
+static void
+wlan_qm_tlv(struct qmsg *m, uint8_t type, const void *v, uint16_t len)
+{
+	if (m->n + 3 + len > sizeof(m->b)) {
+		return;
+	}
+	m->b[m->n] = type;
+	memcpy(m->b + m->n + 1, &len, 2);
+	memcpy(m->b + m->n + 3, v, len);
+	m->n += 3 + len;
+}
+
+static void
+wlan_qm_result(struct qmsg *m, boolean_t ok)
+{
+	uint16_t r[2] = { (uint16_t)(ok ? 0 : 1), (uint16_t)(ok ? 0 : 1) };
+
+	wlan_qm_tlv(m, 2, r, 4);
+}
+
+static const uint8_t *
+wlan_qm_find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
+{
+	uint32_t o = 7;
+
+	while (o + 3 <= len) {
+		uint16_t l;
+
+		memcpy(&l, d + o + 1, 2);
+		if (o + 3 + l > len) {
+			break;
+		}
+		if (d[o] == type) {
+			*tlen = l;
+			return d + o + 3;
+		}
+		o += 3 + l;
+	}
+	return NULL;
+}
+
+static void
+wlan_qm_string(const uint8_t *d, uint32_t len, uint8_t type, char *out,
+    size_t max)
+{
+	uint16_t l = 0;
+	const uint8_t *v = wlan_qm_find(d, len, type, &l);
+
+	out[0] = 0;
+	if (v != NULL) {
+		l = (uint16_t)MIN((size_t)l, max - 1);
+		memcpy(out, v, l);
+		out[l] = 0;
+	}
+}
+
+static void
+wlan_qm_send(struct qmsg *m, uint32_t src_port, uint32_t node, uint32_t port)
+{
+	uint16_t l = (uint16_t)(m->n - 7);
+
+	memcpy(m->b + 5, &l, 2);
+	wlan_qrtr_send(QRTR_TYPE_DATA, src_port, node, port, m->b, m->n);
+}
+
+static boolean_t
+wlan_streq(const char *a, const char *b)
+{
+	while (*a != 0 && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static void
+wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
+    const uint8_t *d, uint32_t len)
+{
+	static const struct {
+		const char *svc, *domain;
+	} map[] = {
+		{ "tms/servreg",       "msm/modem/root_pd" },
+		{ "tms/pdr_enabled",   "msm/modem/root_pd" },
+		{ "gps/gps_service",   "msm/modem/root_pd" },
+		{ "kernel/elf_loader", "msm/modem/wlan_pd" },
+		{ "tms/servreg",       "msm/modem/wlan_pd" },
+		{ "wlan/fw",           "msm/modem/wlan_pd" },
+	};
+	struct qmsg m;
+	char name[80];
+	uint8_t list[256];
+	uint32_t n = 1, cnt = 0;
+	uint16_t v;
+
+	wlan_qm_init(&m, txn, msg);
+	if (msg != 0x21) {
+		wlan_qm_result(&m, TRUE);
+		wlan_qm_send(&m, PORT_PDM, node, port);
+		return;
+	}
+	wlan_qm_string(d, len, 1, name, sizeof(name));
+	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		if (wlan_streq(map[i].svc, name)) {
+			uint32_t dl = 0, inst = 180, zero = 0;
+
+			while (map[i].domain[dl] != 0) {
+				dl++;
+			}
+			if (n + dl + 10 > sizeof(list)) {
+				break;
+			}
+			list[n++] = (uint8_t)dl;
+			memcpy(list + n, map[i].domain, dl);
+			n += dl;
+			memcpy(list + n, &inst, 4);
+			n += 4;
+			list[n++] = 0;          /* service_data_valid */
+			memcpy(list + n, &zero, 4);
+			n += 4;
+			cnt++;
+		}
+	}
+	list[0] = (uint8_t)cnt;
+	wlan_qm_result(&m, TRUE);
+	v = (uint16_t)cnt;
+	wlan_qm_tlv(&m, 0x10, &v, 2);
+	v = 1;
+	wlan_qm_tlv(&m, 0x11, &v, 2);
+	if (cnt != 0) {
+		wlan_qm_tlv(&m, 0x12, list, (uint16_t)n);
+	}
+	wlan_qm_send(&m, PORT_PDM, node, port);
+	pd_reqs++;
+	printf("SWEET WLAN: pd-mapper \"%s\" -> %u domain(s)\n", name, cnt);
+}
+
+static void
+wlan_svc_announce(void)
+{
+	struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, 0x40, 0x101,
+	    QRTR_NODE_APPS, PORT_PDM };
+
+	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
+	    QRTR_PORT_CTRL, &c, sizeof(c));
+	printf("SWEET WLAN: announced pd-mapper 0x40:0x101 port %x\n",
+	    PORT_PDM);
+}
+
+static boolean_t
+wlan_svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port,
+    const uint8_t *d, uint32_t len)
+{
+	uint16_t txn, msg;
+
+	if (dst_port != PORT_PDM || len < 7 || d[0] != QMI_REQ) {
+		return FALSE;
+	}
+	memcpy(&txn, d + 1, 2);
+	memcpy(&msg, d + 3, 2);
+	wlan_pdm_rx(src_node, src_port, txn, msg, d, len);
+	return TRUE;
+}
+
 static void
 wlan_qrtr_rx(const uint8_t *p, uint32_t len)
 {
@@ -1121,6 +1308,8 @@ wlan_qrtr_rx(const uint8_t *p, uint32_t len)
 			wlan_qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node,
 			    src_port, &r, sizeof(r));
 		}
+		(void)wlan_svc_rx(src_node, src_port, dst_port, p + hlen,
+		    size);
 		break;
 	default:
 		break;
@@ -1381,6 +1570,10 @@ wlan_glink_poll(unsigned ms)
 		q_hello_sent = TRUE;
 		printf("SWEET WLAN: t=%u ms sent qrtr HELLO to node %x\n", ms,
 		    q_modem_node);
+	}
+	if (wlan_chan_up() && q_hello_rx && !q_announced) {
+		wlan_svc_announce();
+		q_announced = TRUE;
 	}
 	if (ms >= 2000 && !g_open_sent && g_rx != NULL) {
 		printf("SWEET WLAN: t=%u ms modem did not open IPCRTR, "
