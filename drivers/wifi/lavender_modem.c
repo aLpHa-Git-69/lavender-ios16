@@ -52,6 +52,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
 extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern int santoni_emmc_read(uint64_t lba, uint32_t count, void *buf);
+extern void lavender_wlan_after_modem(void);
 
 #define IO_CHUNK        (2u << 20)      /* windows into the 118 MiB image */
 
@@ -1294,7 +1295,9 @@ lavender_modem_thread(__unused void *arg, __unused wait_result_t wr_)
 				printf("SWEET MODEM: no memory for the MDT\n");
 			} else if (modem_load_mdt() == 0 &&
 			    modem_load_segments() == 0) {
-				(void)modem_auth();
+				if (modem_auth() == 0) {
+					lavender_wlan_after_modem();
+				}
 			}
 		}
 	}
