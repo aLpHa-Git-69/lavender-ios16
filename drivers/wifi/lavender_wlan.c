@@ -1170,7 +1170,6 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 	char name[80];
 	uint8_t list[256];
 	uint32_t n = 2, cnt = 0;
-	uint16_t v;
 
 	wlan_qm_init(&m, txn, msg);
 	if (msg != 0x21) {
@@ -1210,13 +1209,21 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 	 * one byte) + the entries, per servreg_loc_get_domain_list_resp_ei.
 	 * 0717 sent only [count][entries] (the topaz layout).
 	 */
+	/*
+	 * TLVs 16 and 17 are QMI_OPT_FLAG + value too: the modem rejected the
+	 * 0719 response because these two lacked the leading validity byte.
+	 */
 	list[0] = cnt != 0 ? 1 : 0;
 	list[1] = (uint8_t)cnt;
 	wlan_qm_result(&m, TRUE);
-	v = (uint16_t)cnt;
-	wlan_qm_tlv(&m, 0x10, &v, 2);
-	v = 1;
-	wlan_qm_tlv(&m, 0x11, &v, 2);
+	{
+		uint8_t t16[3] = { 1, (uint8_t)(cnt & 0xff),
+		    (uint8_t)(cnt >> 8) };
+		uint8_t t17[3] = { 1, 1, 0 };
+
+		wlan_qm_tlv(&m, 0x10, t16, sizeof(t16));
+		wlan_qm_tlv(&m, 0x11, t17, sizeof(t17));
+	}
 	if (cnt != 0) {
 		wlan_qm_tlv(&m, 0x12, list, (uint16_t)n);
 	}
