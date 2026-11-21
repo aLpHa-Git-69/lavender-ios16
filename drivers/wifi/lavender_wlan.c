@@ -1168,11 +1168,12 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 	struct qmsg m;
 	char name[80];
 	uint8_t list[256];
-	uint32_t n = 1, cnt = 0;
+	uint32_t n = 2, cnt = 0;
 	uint16_t v;
 
 	wlan_qm_init(&m, txn, msg);
 	if (msg != 0x21) {
+		printf("SWEET WLAN: pd-mapper msg %x (ack)\n", msg);
 		wlan_qm_result(&m, TRUE);
 		wlan_qm_send(&m, PORT_PDM, node, port);
 		return;
@@ -1199,7 +1200,13 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 			cnt++;
 		}
 	}
-	list[0] = (uint8_t)cnt;
+	/*
+	 * TLV 18 is QMI_OPT_FLAG (domain_list_valid) + QMI_DATA_LEN (count as
+	 * one byte) + the entries, per servreg_loc_get_domain_list_resp_ei.
+	 * 0717 sent only [count][entries] (the topaz layout).
+	 */
+	list[0] = cnt != 0 ? 1 : 0;
+	list[1] = (uint8_t)cnt;
 	wlan_qm_result(&m, TRUE);
 	v = (uint16_t)cnt;
 	wlan_qm_tlv(&m, 0x10, &v, 2);
@@ -1777,7 +1784,7 @@ lavender_wlan_after_modem(void)
 		    sk_last, ready ? "READY" : "not ready");
 		if (ready) {
 			if (wlan_glink_start(part)) {
-				for (i2 = 0; i2 < 30000; i2++) {
+				for (i2 = 0; i2 < 120000; i2++) {
 					wlan_glink_poll(i2);
 					if (q_wlfw_seen) {
 						break;
