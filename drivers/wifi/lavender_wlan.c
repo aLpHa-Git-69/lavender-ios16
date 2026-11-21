@@ -437,6 +437,49 @@ wlan_f2_items(struct smem_part_hdr *p)
 	    p->free_uncached, p->free_cached);
 }
 
+/*
+ * 0713: the partition has an uncached area growing up from offset_free_uncached
+ * and a cached area packed down from the end; qcom_smem walks the latter from
+ * free_cached upward. One 0x4000-byte item is already there, so the GLINK
+ * FIFO may live in this half.
+ */
+static void
+wlan_f2_items_cached(struct smem_part_hdr *p)
+{
+	uint8_t *base = (uint8_t *)p;
+	uint32_t pos = p->free_cached;
+	unsigned n = 0;
+
+	if (p->free_cached < sizeof(*p) || p->free_cached > p->size) {
+		printf("SWEET WLAN: cached area %x/%x (not walked)\n",
+		    p->free_cached, p->size);
+		return;
+	}
+	while (pos + sizeof(struct smem_priv_entry) <= p->size && n < 64) {
+		struct smem_priv_entry *h =
+		    (struct smem_priv_entry *)(base + pos);
+
+		if (h->canary != 0xa5a5) {
+			printf("SWEET WLAN: cached walk stops at %u (canary "
+			    "%04x)\n", n, h->canary);
+			break;
+		}
+		printf("SWEET WLAN: cached item %u size %u pad %u/%u\n", h->item,
+		    h->size, h->pad_data, h->pad_hdr);
+		if (h->item == ITEM_GLINK_DESC && h->size >= 32) {
+			uint32_t *d = (uint32_t *)(void *)(h + 1);
+
+			printf("SWEET WLAN: glink desc(c) %08x %08x %08x %08x "
+			    "%08x %08x %08x %08x\n", d[0], d[1], d[2], d[3],
+			    d[4], d[5], d[6], d[7]);
+		}
+		pos += sizeof(*h) + h->pad_hdr + h->size;
+		n++;
+	}
+	printf("SWEET WLAN: %u cached items from %x to %x\n", n,
+	    p->free_cached, p->size);
+}
+
 static void
 wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
 {
@@ -524,6 +567,7 @@ lavender_wlan_after_modem(void)
 	printf("SWEET WLAN: APPS/MODEM partition off %05x after %u ms\n",
 	    (uint32_t)((uint8_t *)part - (uint8_t *)smem), i * 500);
 	wlan_f2_items(part);
+	wlan_f2_items_cached(part);
 	wlan_f2_smp2p(part, ITEM_SMP2P_OUT, "out");
 	wlan_f2_smp2p(part, ITEM_SMP2P_IN, "in");
 	if (apcs != 0) {
