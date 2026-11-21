@@ -2021,8 +2021,7 @@ step21_draw(void)
 	ring_reg(0xe2a0u, 0xff);				/* VPC_FS_PRIMITIVEID_CNTL */
 	ring_reg(0xe21cu, 0);					/* RB_CLEAR_CNTL */
 	if (ring_submit("restore") != 0) {
-		printf("LAVGPU: the CP stalled in the restore chunk
-");
+		printf("LAVGPU: the CP stalled in the restore chunk\n");
 		return;
 	}
 	/* emit_sysmem_prep */
@@ -2045,8 +2044,7 @@ step21_draw(void)
 	ring_pkt7(0x64u, 1);					/* CP_SET_VISIBILITY_OVERRIDE */
 	ring_put(1);
 	if (ring_submit("prep") != 0) {
-		printf("LAVGPU: the CP stalled in the prep chunk
-");
+		printf("LAVGPU: the CP stalled in the prep chunk\n");
 		return;
 	}
 	/* emit_mrt (one target, linear RGBA8) and emit_msaa (one sample) */
@@ -2067,8 +2065,7 @@ step21_draw(void)
 	ring_put(0);
 	ring_put(4);
 	if (ring_submit("mrt") != 0) {
-		printf("LAVGPU: the CP stalled in the mrt chunk
-");
+		printf("LAVGPU: the CP stalled in the mrt chunk\n");
 		return;
 	}
 	/* fd5_emit_state: render targets, blend, depth/stencil, viewport, scissor */
@@ -2109,8 +2106,7 @@ step21_draw(void)
 	ring_reg(0xe151u, 0x10001u);				/* RB_MRT_BLEND_CONTROL(0): src ONE, dst ZERO */
 	ring_reg(0xe5c9u, 0x100);				/* SP_BLEND_CNTL */
 	if (ring_submit("state") != 0) {
-		printf("LAVGPU: the CP stalled in the state chunk
-");
+		printf("LAVGPU: the CP stalled in the state chunk\n");
 		return;
 	}
 	ring_reg(0xe1a9u, 0xffff0100u);				/* RB_BLEND_CNTL: sample mask, independent */
@@ -2153,8 +2149,7 @@ step21_draw(void)
 	ring_put((uint32_t)vs_pa);
 	ring_put((uint32_t)(vs_pa >> 32));
 	if (ring_submit("prog1") != 0) {
-		printf("LAVGPU: the CP stalled in the prog1 chunk
-");
+		printf("LAVGPU: the CP stalled in the prog1 chunk\n");
 		return;
 	}
 	ring_pkt7(CP_LOAD_STATE4, 3);				/* VS into the SP */
@@ -2203,8 +2198,7 @@ step21_draw(void)
 	ring_put((uint32_t)fs_pa);
 	ring_put((uint32_t)(fs_pa >> 32));
 	if (ring_submit("prog2") != 0) {
-		printf("LAVGPU: the CP stalled in the prog2 chunk
-");
+		printf("LAVGPU: the CP stalled in the prog2 chunk\n");
 		return;
 	}
 	ring_pkt4(0xe401u, 5);					/* VFD_CONTROL_1..5 */
@@ -2230,8 +2224,7 @@ step21_draw(void)
 	ring_reg(0xe38cu, 0xffffffffu);				/* PC_RESTART_INDEX */
 	/* fd5_emit_render_cntl and the draw */
 	if (ring_submit("vtx") != 0) {
-		printf("LAVGPU: the CP stalled in the vtx chunk
-");
+		printf("LAVGPU: the CP stalled in the vtx chunk\n");
 		return;
 	}
 	ring_reg(0xe141u, 0x8);					/* RB_RENDER_CNTL */
