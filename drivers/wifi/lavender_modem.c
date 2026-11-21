@@ -816,7 +816,7 @@ lavender_modem_fw_read(const char *name, uint32_t off, void *dst, uint32_t len)
 #define PART_MAX        4
 #define PART_MAX_SIZE   (16u << 20)
 #define PART_CHUNK      (512u << 10)
-#define RMTFS_BUF_PA    0x86200000ull
+#define RMTFS_BUF_PA    0x92000000ull
 #define RMTFS_BUF_SIZE  0x200000u
 
 struct part_copy {
@@ -1007,9 +1007,10 @@ lavender_modem_part_write(const char *name, uint32_t off, const void *src,
 }
 
 /*
- * The modem stages rmtfs transfers in this buffer. 0x86200000 is the
- * removed_regions reserve from the lavender DTB: outside the memory map XNU
- * received, so it is ours to hand to the MSS.
+ * The modem stages rmtfs transfers in this buffer. 0x92000000 sits inside
+ * modem_fw_region (0x8ac00000+0x7e00000), past the last loaded segment; F1's
+ * reclaim hands exactly this 2 MiB chunk back to the HLOS, so the hypervisor
+ * already accepts an assign between the two VMs here.
  */
 int
 lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size)
