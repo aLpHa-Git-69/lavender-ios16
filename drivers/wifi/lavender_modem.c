@@ -50,9 +50,22 @@
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
 extern void ml_io_unmap(vm_offset_t, vm_size_t);
 extern int santoni_emmc_read(uint64_t lba, uint32_t count, void *buf);
 extern void lavender_wlan_after_modem(void);
+
+int lavender_modem_fw_size(const char *name, uint32_t *size);
+int lavender_modem_fw_read(const char *name, uint32_t off, void *dst,
+    uint32_t len);
+int lavender_modem_part_prepare(const char *name, uint32_t *size);
+int lavender_modem_part_read(const char *name, uint32_t off, void *dst,
+    uint32_t len);
+int lavender_modem_part_write(const char *name, uint32_t off, const void *src,
+    uint32_t len);
+int lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size);
+int lavender_modem_rmtfs_copy(uint32_t off, void *buf, uint32_t len,
+    boolean_t to_buf);
 
 #define IO_CHUNK        (2u << 20)      /* windows into the 118 MiB image */
 
@@ -796,6 +809,249 @@ lavender_modem_fw_read(const char *name, uint32_t off, void *dst, uint32_t len)
 		}
 	}
 	return (int)done;
+}
+
+/* --- rmtfs: EFS partitions and shared buffer (0722) ---------------------- */
+
+#define PART_MAX        4
+#define PART_MAX_SIZE   (16u << 20)
+#define PART_CHUNK      (512u << 10)
+#define RMTFS_BUF_PA    0x86200000ull
+#define RMTFS_BUF_SIZE  0x200000u
+
+struct part_copy {
+	boolean_t used;
+	char name[16];
+	uint64_t lba;
+	uint32_t size;
+	uint8_t *buf;
+};
+
+static struct part_copy g_parts[PART_MAX];
+static vm_offset_t g_rmtfs_va;
+static boolean_t g_rmtfs_ready;
+
+static uint64_t
+le64(const uint8_t *p)
+{
+	return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
+}
+
+static int
+gpt_lookup(const char *name, uint64_t *lba, uint64_t *sectors)
+{
+	uint8_t *h = bounce;
+	uint64_t entry_lba;
+	uint32_t nent, esz, blocks;
+	int err;
+
+	err = emmc_read(1, 1, h);
+	if (err) {
+		return err;
+	}
+	if (memcmp(h, "EFI PART", 8) != 0) {
+		printf("SWEET MODEM: eMMC has no GPT\n");
+		return ENXIO;
+	}
+	entry_lba = le64(h + 72);
+	nent = le32(h + 80);
+	esz = le32(h + 84);
+	if (esz != 128 || nent == 0 || nent > FAT_BOUNCE_SIZE / 128) {
+		printf("SWEET MODEM: unsupported GPT (%u x %u)\n", nent, esz);
+		return EINVAL;
+	}
+	blocks = (nent * 128 + SECTOR_SIZE - 1) / SECTOR_SIZE;
+	err = emmc_read(entry_lba, blocks, h);
+	if (err) {
+		return err;
+	}
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = h + (uint64_t)i * 128;
+		char n[37];
+		unsigned c;
+
+		for (c = 0; c < 36; c++) {
+			uint16_t ch = (uint16_t)(e[56 + 2 * c] |
+			    (e[57 + 2 * c] << 8));
+
+			if (ch == 0 || ch > 0x7f) {
+				break;
+			}
+			n[c] = (char)ch;
+		}
+		n[c] = 0;
+		if (c == 0 || strcasecmp(n, name) != 0) {
+			continue;
+		}
+		*lba = le64(e + 32);
+		*sectors = le64(e + 40) - *lba + 1;
+		return 0;
+	}
+	return ENOENT;
+}
+
+/*
+ * Copy one EFS partition to RAM once. The modem writes its EFS through the
+ * host, so the copy absorbs the writes and the eMMC is only read (0722).
+ */
+int
+lavender_modem_part_prepare(const char *name, uint32_t *size)
+{
+	struct part_copy *p = NULL;
+	uint64_t lba, sectors, bytes, off;
+	int err;
+
+	for (unsigned i = 0; i < PART_MAX; i++) {
+		if (g_parts[i].used && strcasecmp(g_parts[i].name, name) == 0) {
+			*size = g_parts[i].size;
+			return 0;
+		}
+		if (!g_parts[i].used && p == NULL) {
+			p = &g_parts[i];
+		}
+	}
+	if (p == NULL) {
+		return ENOSPC;
+	}
+	err = gpt_lookup(name, &lba, &sectors);
+	if (err) {
+		printf("SWEET MODEM: rmtfs partition %s not in the GPT (%d)\n",
+		    name, err);
+		return err;
+	}
+	bytes = sectors * SECTOR_SIZE;
+	if (bytes == 0 || bytes > PART_MAX_SIZE) {
+		printf("SWEET MODEM: rmtfs partition %s has %llu bytes\n", name,
+		    (unsigned long long)bytes);
+		return EFBIG;
+	}
+	if (kmem_alloc_contig(kernel_map, (vm_offset_t *)&p->buf,
+	    (vm_size_t)bytes, PAGE_MASK, 0xff000, 0, KMA_DATA | KMA_ZERO,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("SWEET MODEM: rmtfs partition %s: no %llu bytes\n", name,
+		    (unsigned long long)bytes);
+		p->buf = NULL;
+		return ENOMEM;
+	}
+	for (off = 0; off < bytes; off += PART_CHUNK) {
+		uint32_t n = (uint32_t)MIN((uint64_t)PART_CHUNK, bytes - off);
+
+		err = emmc_read(lba + off / SECTOR_SIZE, n / SECTOR_SIZE,
+		    p->buf + off);
+		if (err) {
+			printf("SWEET MODEM: rmtfs %s read failed %d at %llu\n",
+			    name, err, (unsigned long long)off);
+			kmem_free(kernel_map, (vm_offset_t)p->buf,
+			    (vm_size_t)bytes);
+			p->buf = NULL;
+			return err;
+		}
+	}
+	p->used = TRUE;
+	p->lba = lba;
+	p->size = (uint32_t)bytes;
+	memset(p->name, 0, sizeof(p->name));
+	for (unsigned i = 0; i + 1 < sizeof(p->name) && name[i] != 0; i++) {
+		p->name[i] = name[i];
+	}
+	printf("SWEET MODEM: rmtfs %s: %llu sectors at %llx, %u bytes "
+	    "copied to RAM\n", name, (unsigned long long)sectors,
+	    (unsigned long long)lba, p->size);
+	*size = p->size;
+	return 0;
+}
+
+static struct part_copy *
+part_find(const char *name)
+{
+	for (unsigned i = 0; i < PART_MAX; i++) {
+		if (g_parts[i].used && strcasecmp(g_parts[i].name, name) == 0) {
+			return &g_parts[i];
+		}
+	}
+	return NULL;
+}
+
+int
+lavender_modem_part_read(const char *name, uint32_t off, void *dst,
+    uint32_t len)
+{
+	struct part_copy *p = part_find(name);
+
+	if (p == NULL) {
+		return ENXIO;
+	}
+	if (off >= p->size) {
+		return 0;
+	}
+	len = MIN(len, p->size - off);
+	memcpy(dst, p->buf + off, len);
+	return (int)len;
+}
+
+int
+lavender_modem_part_write(const char *name, uint32_t off, const void *src,
+    uint32_t len)
+{
+	struct part_copy *p = part_find(name);
+
+	if (p == NULL) {
+		return ENXIO;
+	}
+	if (off >= p->size) {
+		return 0;
+	}
+	len = MIN(len, p->size - off);
+	memcpy(p->buf + off, src, len);
+	return (int)len;
+}
+
+/*
+ * The modem stages rmtfs transfers in this buffer. 0x86200000 is the
+ * removed_regions reserve from the lavender DTB: outside the memory map XNU
+ * received, so it is ours to hand to the MSS.
+ */
+int
+lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size)
+{
+	if (!g_rmtfs_ready) {
+		g_rmtfs_va = ml_io_map_wcomb((vm_offset_t)RMTFS_BUF_PA,
+		    RMTFS_BUF_SIZE);
+		if (g_rmtfs_va == 0) {
+			printf("SWEET MODEM: rmtfs buffer map failed\n");
+			return ENOMEM;
+		}
+		io_zero(g_rmtfs_va, RMTFS_BUF_SIZE);
+		if (scm_assign((uint32_t)RMTFS_BUF_PA, RMTFS_BUF_SIZE,
+		    VMID_HLOS, VMID_MSS_MSA, PERM_READ | PERM_WRITE) != 0) {
+			printf("SWEET MODEM: rmtfs buffer assign failed\n");
+			return EIO;
+		}
+		g_rmtfs_ready = TRUE;
+		printf("SWEET MODEM: rmtfs buffer %08llx+%x assigned to MSS\n",
+		    (unsigned long long)RMTFS_BUF_PA, RMTFS_BUF_SIZE);
+	}
+	*pa = RMTFS_BUF_PA;
+	*size = RMTFS_BUF_SIZE;
+	return 0;
+}
+
+int
+lavender_modem_rmtfs_copy(uint32_t off, void *buf, uint32_t len,
+    boolean_t to_buf)
+{
+	if (!g_rmtfs_ready) {
+		return ENXIO;
+	}
+	if (off > RMTFS_BUF_SIZE || len > RMTFS_BUF_SIZE - off) {
+		return EINVAL;
+	}
+	if (to_buf) {
+		memcpy((uint8_t *)g_rmtfs_va + off, buf, len);
+	} else {
+		memcpy(buf, (uint8_t *)g_rmtfs_va + off, len);
+	}
+	return (int)len;
 }
 
 /*

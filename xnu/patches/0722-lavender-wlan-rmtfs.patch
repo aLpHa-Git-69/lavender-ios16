@@ -1,0 +1,574 @@
+diff --git a/bsd/dev/lavender_modem.c b/bsd/dev/lavender_modem.c
+index 2297871..71e05f9 100644
+--- a/bsd/dev/lavender_modem.c
++++ b/bsd/dev/lavender_modem.c
+@@ -50,10 +50,23 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern int santoni_emmc_read(uint64_t lba, uint32_t count, void *buf);
+ extern void lavender_wlan_after_modem(void);
+ 
++int lavender_modem_fw_size(const char *name, uint32_t *size);
++int lavender_modem_fw_read(const char *name, uint32_t off, void *dst,
++    uint32_t len);
++int lavender_modem_part_prepare(const char *name, uint32_t *size);
++int lavender_modem_part_read(const char *name, uint32_t off, void *dst,
++    uint32_t len);
++int lavender_modem_part_write(const char *name, uint32_t off, const void *src,
++    uint32_t len);
++int lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size);
++int lavender_modem_rmtfs_copy(uint32_t off, void *buf, uint32_t len,
++    boolean_t to_buf);
++
+ #define IO_CHUNK        (2u << 20)      /* windows into the 118 MiB image */
+ 
+ #define GCC_PA          0x00100000u
+@@ -798,6 +811,249 @@ lavender_modem_fw_read(const char *name, uint32_t off, void *dst, uint32_t len)
+ 	return (int)done;
+ }
+ 
++/* --- rmtfs: EFS partitions and shared buffer (0722) ---------------------- */
++
++#define PART_MAX        4
++#define PART_MAX_SIZE   (16u << 20)
++#define PART_CHUNK      (512u << 10)
++#define RMTFS_BUF_PA    0x86200000ull
++#define RMTFS_BUF_SIZE  0x200000u
++
++struct part_copy {
++	boolean_t used;
++	char name[16];
++	uint64_t lba;
++	uint32_t size;
++	uint8_t *buf;
++};
++
++static struct part_copy g_parts[PART_MAX];
++static vm_offset_t g_rmtfs_va;
++static boolean_t g_rmtfs_ready;
++
++static uint64_t
++le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
++}
++
++static int
++gpt_lookup(const char *name, uint64_t *lba, uint64_t *sectors)
++{
++	uint8_t *h = bounce;
++	uint64_t entry_lba;
++	uint32_t nent, esz, blocks;
++	int err;
++
++	err = emmc_read(1, 1, h);
++	if (err) {
++		return err;
++	}
++	if (memcmp(h, "EFI PART", 8) != 0) {
++		printf("SWEET MODEM: eMMC has no GPT\n");
++		return ENXIO;
++	}
++	entry_lba = le64(h + 72);
++	nent = le32(h + 80);
++	esz = le32(h + 84);
++	if (esz != 128 || nent == 0 || nent > FAT_BOUNCE_SIZE / 128) {
++		printf("SWEET MODEM: unsupported GPT (%u x %u)\n", nent, esz);
++		return EINVAL;
++	}
++	blocks = (nent * 128 + SECTOR_SIZE - 1) / SECTOR_SIZE;
++	err = emmc_read(entry_lba, blocks, h);
++	if (err) {
++		return err;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = h + (uint64_t)i * 128;
++		char n[37];
++		unsigned c;
++
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] |
++			    (e[57 + 2 * c] << 8));
++
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			n[c] = (char)ch;
++		}
++		n[c] = 0;
++		if (c == 0 || strcasecmp(n, name) != 0) {
++			continue;
++		}
++		*lba = le64(e + 32);
++		*sectors = le64(e + 40) - *lba + 1;
++		return 0;
++	}
++	return ENOENT;
++}
++
++/*
++ * Copy one EFS partition to RAM once. The modem writes its EFS through the
++ * host, so the copy absorbs the writes and the eMMC is only read (0722).
++ */
++int
++lavender_modem_part_prepare(const char *name, uint32_t *size)
++{
++	struct part_copy *p = NULL;
++	uint64_t lba, sectors, bytes, off;
++	int err;
++
++	for (unsigned i = 0; i < PART_MAX; i++) {
++		if (g_parts[i].used && strcasecmp(g_parts[i].name, name) == 0) {
++			*size = g_parts[i].size;
++			return 0;
++		}
++		if (!g_parts[i].used && p == NULL) {
++			p = &g_parts[i];
++		}
++	}
++	if (p == NULL) {
++		return ENOSPC;
++	}
++	err = gpt_lookup(name, &lba, &sectors);
++	if (err) {
++		printf("SWEET MODEM: rmtfs partition %s not in the GPT (%d)\n",
++		    name, err);
++		return err;
++	}
++	bytes = sectors * SECTOR_SIZE;
++	if (bytes == 0 || bytes > PART_MAX_SIZE) {
++		printf("SWEET MODEM: rmtfs partition %s has %llu bytes\n", name,
++		    (unsigned long long)bytes);
++		return EFBIG;
++	}
++	if (kmem_alloc_contig(kernel_map, (vm_offset_t *)&p->buf,
++	    (vm_size_t)bytes, PAGE_MASK, 0xff000, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET MODEM: rmtfs partition %s: no %llu bytes\n", name,
++		    (unsigned long long)bytes);
++		p->buf = NULL;
++		return ENOMEM;
++	}
++	for (off = 0; off < bytes; off += PART_CHUNK) {
++		uint32_t n = (uint32_t)MIN((uint64_t)PART_CHUNK, bytes - off);
++
++		err = emmc_read(lba + off / SECTOR_SIZE, n / SECTOR_SIZE,
++		    p->buf + off);
++		if (err) {
++			printf("SWEET MODEM: rmtfs %s read failed %d at %llu\n",
++			    name, err, (unsigned long long)off);
++			kmem_free(kernel_map, (vm_offset_t)p->buf,
++			    (vm_size_t)bytes);
++			p->buf = NULL;
++			return err;
++		}
++	}
++	p->used = TRUE;
++	p->lba = lba;
++	p->size = (uint32_t)bytes;
++	memset(p->name, 0, sizeof(p->name));
++	for (unsigned i = 0; i + 1 < sizeof(p->name) && name[i] != 0; i++) {
++		p->name[i] = name[i];
++	}
++	printf("SWEET MODEM: rmtfs %s: %llu sectors at %llx, %u bytes "
++	    "copied to RAM\n", name, (unsigned long long)sectors,
++	    (unsigned long long)lba, p->size);
++	*size = p->size;
++	return 0;
++}
++
++static struct part_copy *
++part_find(const char *name)
++{
++	for (unsigned i = 0; i < PART_MAX; i++) {
++		if (g_parts[i].used && strcasecmp(g_parts[i].name, name) == 0) {
++			return &g_parts[i];
++		}
++	}
++	return NULL;
++}
++
++int
++lavender_modem_part_read(const char *name, uint32_t off, void *dst,
++    uint32_t len)
++{
++	struct part_copy *p = part_find(name);
++
++	if (p == NULL) {
++		return ENXIO;
++	}
++	if (off >= p->size) {
++		return 0;
++	}
++	len = MIN(len, p->size - off);
++	memcpy(dst, p->buf + off, len);
++	return (int)len;
++}
++
++int
++lavender_modem_part_write(const char *name, uint32_t off, const void *src,
++    uint32_t len)
++{
++	struct part_copy *p = part_find(name);
++
++	if (p == NULL) {
++		return ENXIO;
++	}
++	if (off >= p->size) {
++		return 0;
++	}
++	len = MIN(len, p->size - off);
++	memcpy(p->buf + off, src, len);
++	return (int)len;
++}
++
++/*
++ * The modem stages rmtfs transfers in this buffer. 0x86200000 is the
++ * removed_regions reserve from the lavender DTB: outside the memory map XNU
++ * received, so it is ours to hand to the MSS.
++ */
++int
++lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size)
++{
++	if (!g_rmtfs_ready) {
++		g_rmtfs_va = ml_io_map_wcomb((vm_offset_t)RMTFS_BUF_PA,
++		    RMTFS_BUF_SIZE);
++		if (g_rmtfs_va == 0) {
++			printf("SWEET MODEM: rmtfs buffer map failed\n");
++			return ENOMEM;
++		}
++		io_zero(g_rmtfs_va, RMTFS_BUF_SIZE);
++		if (scm_assign((uint32_t)RMTFS_BUF_PA, RMTFS_BUF_SIZE,
++		    VMID_HLOS, VMID_MSS_MSA, PERM_READ | PERM_WRITE) != 0) {
++			printf("SWEET MODEM: rmtfs buffer assign failed\n");
++			return EIO;
++		}
++		g_rmtfs_ready = TRUE;
++		printf("SWEET MODEM: rmtfs buffer %08llx+%x assigned to MSS\n",
++		    (unsigned long long)RMTFS_BUF_PA, RMTFS_BUF_SIZE);
++	}
++	*pa = RMTFS_BUF_PA;
++	*size = RMTFS_BUF_SIZE;
++	return 0;
++}
++
++int
++lavender_modem_rmtfs_copy(uint32_t off, void *buf, uint32_t len,
++    boolean_t to_buf)
++{
++	if (!g_rmtfs_ready) {
++		return ENXIO;
++	}
++	if (off > RMTFS_BUF_SIZE || len > RMTFS_BUF_SIZE - off) {
++		return EINVAL;
++	}
++	if (to_buf) {
++		memcpy((uint8_t *)g_rmtfs_va + off, buf, len);
++	} else {
++		memcpy(buf, (uint8_t *)g_rmtfs_va + off, len);
++	}
++	return (int)len;
++}
++
+ /*
+  * Stream one segment blob; its directory size must match p_filesz. The blob
+  * is copied into the modem carve-out through IO_CHUNK windows.
+diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
+index b0db4a0..b6890db 100644
+--- a/bsd/dev/lavender_wlan.c
++++ b/bsd/dev/lavender_wlan.c
+@@ -56,6 +56,14 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ extern int lavender_modem_fw_size(const char *name, uint32_t *size);
+ extern int lavender_modem_fw_read(const char *name, uint32_t off, void *dst,
+     uint32_t len);
++extern int lavender_modem_part_prepare(const char *name, uint32_t *size);
++extern int lavender_modem_part_read(const char *name, uint32_t off, void *dst,
++    uint32_t len);
++extern int lavender_modem_part_write(const char *name, uint32_t off,
++    const void *src, uint32_t len);
++extern int lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size);
++extern int lavender_modem_rmtfs_copy(uint32_t off, void *buf, uint32_t len,
++    boolean_t to_buf);
+ 
+ #define GCC_PA          0x00100000u
+ #define GCC_SIZE        0x94000u
+@@ -765,6 +773,8 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
+ #define QRTR_TYPE_NEW_SERVER 4
+ #define QRTR_TYPE_RESUME_TX 7
+ #define QMI_SVC_WLFW      0x45
++#define QMI_REQ           0
++#define QMI_RESP          2
+ 
+ /*
+  * Host services (topaz layout): the modem's elf loader fetches
+@@ -784,6 +794,10 @@ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
+ #define TFTP_ERROR        5
+ #define TFTP_OACK         6
+ 
++#define RMTFS_SVC         14
++#define PORT_RMTFS        0x4000
++#define RMTFS_SECTOR      512
++
+ struct glink_msg {
+ 	uint16_t cmd, p1;
+ 	uint32_t p2;
+@@ -1343,10 +1357,217 @@ wlan_tftp_sess_rx(uint32_t port, const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/* --- F2 step 5b: rmtfs (EFS partitions over QRTR, writes to RAM) --------- */
++
++static const struct {
++	const char *path, *part;
++} rmtfs_map[4] = {
++	{ "/boot/modem_fs1", "modemst1" },
++	{ "/boot/modem_fs2", "modemst2" },
++	{ "/boot/modem_fsc", "fsc" },
++	{ "/boot/modem_fsg", "fsg" },
++};
++
++static struct {
++	boolean_t open;
++	char part[16];
++} rmtfs_caller[4];
++
++static const uint8_t *wlan_qm_find(const uint8_t *d, uint32_t len,
++    uint8_t type, uint16_t *tlen);
++
++static void
++wlan_rmtfs_send(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
++    boolean_t ok, uint8_t type, const void *opt, uint16_t optlen)
++{
++	uint8_t r[64];
++	uint16_t n = 7, zero = 0, one = 1, four = 4;
++
++	r[0] = QMI_RESP;
++	memcpy(r + 1, &txn, 2);
++	memcpy(r + 3, &msg, 2);
++	r[n] = 2;
++	memcpy(r + n + 1, &four, 2);
++	memcpy(r + n + 3, ok ? &zero : &one, 2);
++	memcpy(r + n + 5, ok ? &zero : &one, 2);
++	n += 7;
++	if (ok && opt != NULL && optlen <= 16) {
++		uint16_t l = optlen;
++
++		r[n] = type;
++		memcpy(r + n + 1, &l, 2);
++		memcpy(r + n + 3, opt, optlen);
++		n += 3 + optlen;
++	}
++	{
++		uint16_t body = (uint16_t)(n - 7);
++
++		memcpy(r + 5, &body, 2);
++	}
++	wlan_qrtr_send(QRTR_TYPE_DATA, PORT_RMTFS, node, port, r, n);
++}
++
++static uint32_t
++wlan_qm_u32(const uint8_t *d, uint32_t len, uint8_t type, boolean_t *ok)
++{
++	uint16_t l = 0;
++	const uint8_t *v = wlan_qm_find(d, len, type, &l);
++	uint32_t x = 0;
++
++	if (v == NULL || l < 4) {
++		*ok = FALSE;
++		return 0;
++	}
++	memcpy(&x, v, 4);
++	return x;
++}
++
++static void
++wlan_rmtfs_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
++{
++	uint16_t txn, msg, mlen;
++	boolean_t ok = TRUE;
++
++	if (len < 7 || d[0] != QMI_REQ) {
++		return;
++	}
++	memcpy(&txn, d + 1, 2);
++	memcpy(&msg, d + 3, 2);
++	memcpy(&mlen, d + 5, 2);
++	(void)mlen;
++	switch (msg) {
++	case 1: {                       /* OPEN: string path -> caller */
++		uint16_t l = 0;
++		const uint8_t *v = wlan_qm_find(d, len, 1, &l);
++		char path[64];
++		uint32_t caller = 4;
++
++		memset(path, 0, sizeof(path));
++		if (v != NULL) {
++			memcpy(path, v, MIN((uint32_t)l,
++			    (uint32_t)sizeof(path) - 1));
++		}
++		for (uint32_t k = 0; k < 4; k++) {
++			if (strcmp(path, rmtfs_map[k].path) == 0) {
++				caller = k;
++			}
++		}
++		if (caller < 4) {
++			uint32_t sz = 0;
++
++			ok = lavender_modem_part_prepare(rmtfs_map[caller].part,
++			    &sz) == 0;
++			if (ok) {
++				rmtfs_caller[caller].open = TRUE;
++				memset(rmtfs_caller[caller].part, 0,
++				    sizeof(rmtfs_caller[caller].part));
++				memcpy(rmtfs_caller[caller].part,
++				    rmtfs_map[caller].part,
++				    strlen(rmtfs_map[caller].part));
++			}
++		}
++		printf("SWEET WLAN: rmtfs open \"%s\" -> %s caller %u\n", path,
++		    caller < 4 ? rmtfs_map[caller].part : "REJECTED", caller);
++		wlan_rmtfs_send(node, port, txn, msg, ok && caller < 4, 0x10,
++		    &caller, 4);
++		break;
++	}
++	case 2: {                       /* CLOSE */
++		uint32_t caller = wlan_qm_u32(d, len, 1, &ok);
++
++		if (caller < 4) {
++			rmtfs_caller[caller].open = FALSE;
++		}
++		printf("SWEET WLAN: rmtfs close caller %u\n", caller);
++		wlan_rmtfs_send(node, port, txn, msg, ok, 0, NULL, 0);
++		break;
++	}
++	case 3: {                       /* RW_IOVEC */
++		uint32_t caller = wlan_qm_u32(d, len, 1, &ok);
++		uint16_t l2 = 0, l3 = 0;
++		const uint8_t *dir = wlan_qm_find(d, len, 2, &l2);
++		const uint8_t *iov = wlan_qm_find(d, len, 3, &l3);
++		uint32_t n = 0, total = 0, first = 0;
++
++		ok = ok && dir != NULL && l2 >= 1 && iov != NULL && l3 >= 1 &&
++		    l3 >= 1 + 12u * iov[0] && caller < 4 &&
++		    rmtfs_caller[caller].open;
++		n = ok ? iov[0] : 0;
++		for (uint32_t k = 0; ok && k < n; k++) {
++			uint32_t e[3], off, bytes, done = 0;
++
++			memcpy(e, iov + 1 + 12 * k, sizeof(e));
++			off = e[0] * RMTFS_SECTOR;
++			bytes = e[2] * RMTFS_SECTOR;
++			if (k == 0) {
++				first = e[0];
++			}
++			total += e[2];
++			while (ok && done < bytes) {
++				uint32_t n2 = MIN(bytes - done,
++				    (uint32_t)sizeof(t_pkt));
++				int r;
++
++				if (dir[0] != 0) {
++					r = lavender_modem_rmtfs_copy(
++					    e[1] + done, t_pkt, n2, FALSE);
++					if (r == (int)n2) {
++						r = lavender_modem_part_write(
++						    rmtfs_caller[caller].part,
++						    off + done, t_pkt, n2);
++					}
++				} else {
++					r = lavender_modem_part_read(
++					    rmtfs_caller[caller].part,
++					    off + done, t_pkt, n2);
++					if (r == (int)n2) {
++						r = lavender_modem_rmtfs_copy(
++						    e[1] + done, t_pkt, n2,
++						    TRUE);
++					}
++				}
++				if (r != (int)n2) {
++					ok = FALSE;
++				}
++				done += n2;
++			}
++		}
++		printf("SWEET WLAN: rmtfs %s caller %u: %u entries, %u sectors "
++		    "from %u: %s\n", dir != NULL && dir[0] ? "write" : "read",
++		    caller, n, total, first, ok ? "ok" : "FAILED");
++		wlan_rmtfs_send(node, port, txn, msg, ok, 0, NULL, 0);
++		break;
++	}
++	case 4: {                       /* ALLOC_BUFF */
++		uint32_t caller = wlan_qm_u32(d, len, 1, &ok);
++		uint32_t size = wlan_qm_u32(d, len, 2, &ok);
++		uint64_t pa = 0;
++		uint32_t bsz = 0;
++
++		ok = ok && lavender_modem_rmtfs_buf(&pa, &bsz) == 0 &&
++		    size <= bsz;
++		printf("SWEET WLAN: rmtfs alloc caller %u %u bytes -> %llx%s\n",
++		    caller, size, (unsigned long long)pa, ok ? "" : " REFUSED");
++		wlan_rmtfs_send(node, port, txn, msg, ok, 0x10, &pa, 8);
++		break;
++	}
++	case 5: {                       /* GET_DEV_ERROR */
++		uint32_t caller = wlan_qm_u32(d, len, 1, &ok);
++		uint8_t status = 0;
++
++		printf("SWEET WLAN: rmtfs dev-error caller %u\n", caller);
++		wlan_rmtfs_send(node, port, txn, msg, ok, 0x10, &status, 1);
++		break;
++	}
++	default:
++		printf("SWEET WLAN: rmtfs unknown request %u (%u bytes)\n", msg,
++		    len);
++		break;
++	}
++}
++
+ /* --- F2 step 4: QMI servreg-locator (pd-mapper) ------------------------- */
+ 
+-#define QMI_REQ   0
+-#define QMI_RESP  2
+ #define PORT_PDM  0x4001
+ 
+ struct qmsg {
+@@ -1529,6 +1750,10 @@ wlan_svc_announce(void)
+ 	    QRTR_NODE_APPS, PORT_PDM };
+ 	struct qrtr_ctrl t = { QRTR_TYPE_NEW_SERVER, TFTP_SVC, 1,
+ 	    QRTR_NODE_APPS, PORT_TFTP };
++	struct qrtr_ctrl r = { QRTR_TYPE_NEW_SERVER, RMTFS_SVC, 1,
++	    QRTR_NODE_APPS, PORT_RMTFS };
++	uint64_t pa = 0;
++	uint32_t bsz = 0;
+ 
+ 	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
+ 	    QRTR_PORT_CTRL, &c, sizeof(c));
+@@ -1538,6 +1763,14 @@ wlan_svc_announce(void)
+ 	    QRTR_PORT_CTRL, &t, sizeof(t));
+ 	printf("SWEET WLAN: announced tftp %u:1 port %x\n", TFTP_SVC,
+ 	    PORT_TFTP);
++	if (lavender_modem_rmtfs_buf(&pa, &bsz) == 0) {
++		wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL,
++		    q_modem_node, QRTR_PORT_CTRL, &r, sizeof(r));
++		printf("SWEET WLAN: announced rmtfs %u:1 port %x buffer %08llx\n",
++		    RMTFS_SVC, PORT_RMTFS, (unsigned long long)pa);
++	} else {
++		printf("SWEET WLAN: rmtfs buffer unavailable, not announced\n");
++	}
+ }
+ 
+ static boolean_t
+@@ -1546,6 +1779,10 @@ wlan_svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port,
+ {
+ 	uint16_t txn, msg;
+ 
++	if (dst_port == PORT_RMTFS) {
++		wlan_rmtfs_rx(src_node, src_port, d, len);
++		return TRUE;
++	}
+ 	if (dst_port == PORT_TFTP) {
+ 		wlan_tftp_req(src_node, src_port, d, len);
+ 		return TRUE;
