@@ -1942,14 +1942,12 @@ draw_mark(const char *what)
 	for (int k = 0; k < 40; k++) {
 		flush_dcache64((addr64_t)(fence_pa + 0x80), 64, TRUE);
 		if (*m == want) {
-			printf("LAVGPU: mark %s ok
-", what);
+			printf("LAVGPU: mark %s ok\n", what);
 			return 0;
 		}
 		lav_wait(5);
 	}
-	printf("LAVGPU: the ME is stuck BEFORE mark %s (fence %08x)
-", what, *m);
+	printf("LAVGPU: the ME is stuck BEFORE mark %s (fence %08x)\n", what, *m);
 	return -1;
 }
 
