@@ -1,0 +1,301 @@
+diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
+index 9f97e60..3a81915 100644
+--- a/bsd/dev/lavender_wlan.c
++++ b/bsd/dev/lavender_wlan.c
+@@ -3,6 +3,8 @@
+  *
+  *   sweetwlan=1       run the F0b platform probe (read only)
+  *   sweetwlan=2       run the F2 SMEM/GLINK probe after the modem auths
++ *   sweetwlan=3       also create the SMP2P out item, answer IPA and wait
++ *                     for the modem READY
+  *   sweetwlandelay=S  seconds to wait after boot before the F0b probe
+  *                     (default 25), so the console ring flusher and the USB
+  *                     live log are up
+@@ -74,6 +76,14 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ #define ITEM_GLINK_TX    479u
+ #define ITEM_GLINK_RX    480u
+ #define SMP2P_MAGIC      0x504d5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY  16
++#define SMP2P_IRQ_BIT    14              /* qcom,irq-bitmask 0x4000 */
++#define SMP2P_SSR_ACK    1
++
++/* SMEM allocation lock: qcom,ipc-spinlock-sfpb @0x01f40000, lock 3 */
++#define TCSR_PA          0x01f43000u
++#define TCSR_SIZE        0x00001000u
++#define SMEM_HWLOCK_OWNER 1u             /* APPS */
+ 
+ /* SMEM v12 (qcom_smem): TOC at the end of the window, partitions in it. */
+ struct smem_pt_entry {
+@@ -135,7 +145,7 @@ struct smp2p_entry {
+ #define WLAN_SID0               0x1a00u
+ #define WLAN_SID1               0x1a01u
+ 
+-static vm_offset_t gcc, smmu, smem, msa, apcs;
++static vm_offset_t gcc, smmu, smem, msa, apcs, tcsr;
+ static int wlan_chan;
+ static uint32_t wlan_mode;
+ 
+@@ -480,6 +490,148 @@ wlan_f2_items_cached(struct smem_part_hdr *p)
+ 	    p->free_cached, p->size);
+ }
+ 
++/* --- F2 step 2: SMP2P out (writes SMEM under the APPS hwlock) ------------ */
++
++static boolean_t
++wlan_smem_lock(void)
++{
++	volatile uint32_t *reg = (volatile uint32_t *)tcsr;
++
++	if (tcsr == 0) {
++		return FALSE;
++	}
++	for (int i = 0; i < 1000; i++) {
++		*reg = SMEM_HWLOCK_OWNER;
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (*reg == SMEM_HWLOCK_OWNER) {
++			return TRUE;
++		}
++		wlan_wait(1);
++	}
++	printf("SWEET WLAN: SMEM hwlock busy (owner %u)\n", *reg);
++	return FALSE;
++}
++
++static void
++wlan_smem_unlock(void)
++{
++	if (tcsr != 0) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		*(volatile uint32_t *)tcsr = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static void *
++wlan_smem_alloc(struct smem_part_hdr *p, uint16_t item, uint32_t size)
++{
++	uint32_t aligned = (size + 7) & ~7u;
++	uint32_t need = sizeof(struct smem_priv_entry) + aligned;
++	void *v;
++
++	v = wlan_f2_item(p, item, NULL);
++	if (v != NULL) {
++		return v;
++	}
++	if (tcsr == 0 || !wlan_smem_lock()) {
++		return NULL;
++	}
++	v = wlan_f2_item(p, item, NULL);
++	if (v == NULL && p->free_uncached + need <= p->free_cached &&
++	    p->free_uncached + need <= p->size) {
++		struct smem_priv_entry *h = (struct smem_priv_entry *)
++		    ((uint8_t *)p + p->free_uncached);
++		uint8_t *d = (uint8_t *)(h + 1);
++
++		h->canary = 0xa5a5;
++		h->item = item;
++		h->size = aligned;
++		h->pad_data = (uint16_t)(aligned - size);
++		h->pad_hdr = 0;
++		h->rsvd = 0;
++		for (uint32_t i = 0; i < aligned; i++) {
++			d[i] = 0;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		p->free_uncached += need;
++		__asm__ volatile("dsb sy" ::: "memory");
++		v = d;
++	} else if (v == NULL) {
++		printf("SWEET WLAN: SMEM partition full (%x..%x need %x)\n",
++		    p->free_uncached, p->free_cached, need);
++	}
++	wlan_smem_unlock();
++	return v;
++}
++
++static void
++wlan_smp2p_kick(void)
++{
++	if (apcs != 0) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(apcs + APCS_IPC_OFF) =
++		    1u << SMP2P_IRQ_BIT;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static boolean_t
++wlan_name_eq(const char *a, const char *b)
++{
++	for (int i = 0; i < 16; i++) {
++		if (a[i] != b[i]) {
++			return FALSE;
++		}
++		if (a[i] == 0) {
++			return TRUE;
++		}
++	}
++	return TRUE;
++}
++
++static volatile uint32_t *
++wlan_smp2p_find(struct smp2p_hdr *h, const char *name)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(h + 1);
++	uint32_t i;
++
++	if (h->magic != SMP2P_MAGIC) {
++		return NULL;
++	}
++	for (i = 0; i < h->valid && i < SMP2P_MAX_ENTRY; i++) {
++		if (wlan_name_eq(e[i].name, name)) {
++			return &e[i].value;
++		}
++	}
++	return NULL;
++}
++
++static volatile uint32_t *
++wlan_smp2p_add(struct smp2p_hdr *h, const char *name, uint32_t value)
++{
++	struct smp2p_entry *e = (struct smp2p_entry *)(h + 1);
++	volatile uint32_t *v = wlan_smp2p_find(h, name);
++	uint32_t i;
++
++	if (v != NULL) {
++		return v;
++	}
++	if (h->valid >= h->total || h->valid >= SMP2P_MAX_ENTRY) {
++		return NULL;
++	}
++	for (i = 0; i < 16; i++) {
++		e[h->valid].name[i] = 0;
++	}
++	for (i = 0; i < 15 && name[i] != 0; i++) {
++		e[h->valid].name[i] = name[i];
++	}
++	e[h->valid].value = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++	h->valid++;
++	wlan_smp2p_kick();
++	return &e[h->valid - 1].value;
++}
++
+ static void
+ wlan_f2_smp2p(struct smem_part_hdr *p, uint16_t item, const char *label)
+ {
+@@ -576,6 +728,114 @@ lavender_wlan_after_modem(void)
+ 		printf("SWEET WLAN: APCS IPC %08x (bit15 modem %u, bit9 adsp "
+ 		    "%u)\n", v, (v >> 15) & 1, (v >> 9) & 1);
+ 	}
++	if (wlan_mode < 3) {
++		printf("SWEET WLAN: F2 probe done (read only)\n");
++		return;
++	}
++
++	/*
++	 * Android's AP creates the SMP2P out item (428) and answers the modem's
++	 * IPA power query; only then does the modem publish slave-kernel READY
++	 * (bit 1) in item 435.
++	 */
++	tcsr = ml_io_map(TCSR_PA, TCSR_SIZE);
++	if (tcsr == 0) {
++		printf("SWEET WLAN: TCSR hwlock map failed\n");
++		return;
++	}
++	{
++		struct smp2p_hdr *in = NULL;
++		struct smp2p_hdr *out;
++		volatile uint32_t *sk = NULL, *ipa_in = NULL, *ipa_out = NULL;
++		uint32_t sk_last = ~0u, ipa_last = ~0u;
++		uint32_t i2, osz = sizeof(struct smp2p_hdr) +
++		    SMP2P_MAX_ENTRY * sizeof(struct smp2p_entry);
++		boolean_t ready = FALSE;
++
++		printf("SWEET WLAN: creating SMP2P out item %u\n",
++		    ITEM_SMP2P_OUT);
++		out = (struct smp2p_hdr *)wlan_smem_alloc(part, ITEM_SMP2P_OUT,
++		    osz);
++		if (out == NULL) {
++			printf("SWEET WLAN: SMP2P out allocation failed\n");
++			return;
++		}
++		if (out->version == 0) {
++			out->magic = SMP2P_MAGIC;
++			out->local_pid = 0;
++			out->remote_pid = 1;
++			out->total = SMP2P_MAX_ENTRY;
++			out->valid = 0;
++			out->features[0] = SMP2P_SSR_ACK;
++			__asm__ volatile("dsb sy" ::: "memory");
++			out->version = 1;
++			wlan_smp2p_kick();
++			printf("SWEET WLAN: SMP2P out created\n");
++		} else {
++			printf("SWEET WLAN: SMP2P out exists v%u valid %u\n",
++			    out->version, out->valid);
++		}
++		ipa_out = wlan_smp2p_add(out, "ipa", 0);
++		printf("SWEET WLAN: SMP2P out ipa entry %s\n", ipa_out != NULL ?
++		    "ready" : "missing");
++
++		for (i2 = 0; i2 < 60000; i2++) {
++			if (in == NULL) {
++				uint32_t sz = 0;
++
++				in = (struct smp2p_hdr *)wlan_f2_item(part,
++				    ITEM_SMP2P_IN, &sz);
++				if (in != NULL && in->magic != SMP2P_MAGIC) {
++					in = NULL;
++				}
++				if (in != NULL) {
++					printf("SWEET WLAN: t=%u ms SMP2P in "
++					    "v%u valid %u\n", i2, in->version,
++					    in->valid);
++				}
++			}
++			if (in != NULL && sk == NULL) {
++				sk = wlan_smp2p_find(in, "slave-kernel");
++			}
++			if (in != NULL && ipa_in == NULL) {
++				ipa_in = wlan_smp2p_find(in, "ipa");
++			}
++			if (sk != NULL && *sk != sk_last) {
++				sk_last = *sk;
++				printf("SWEET WLAN: t=%u ms slave-kernel %08x"
++				    "%s%s%s\n", i2, sk_last,
++				    (sk_last & 1) ? " FATAL" : "",
++				    (sk_last & 2) ? " READY" : "",
++				    (sk_last & 4) ? " HANDOVER" : "");
++				if ((sk_last & 2) && !ready) {
++					ready = TRUE;
++					printf("SWEET WLAN: modem READY\n");
++				}
++				if (sk_last & 1) {
++					break;
++				}
++			}
++			if (ipa_in != NULL && ipa_out != NULL &&
++			    *ipa_in != ipa_last) {
++				uint32_t v = *ipa_in;
++
++				if ((v & 1) && (ipa_last == ~0u ||
++				    !(ipa_last & 1))) {
++					*ipa_out = 1;
++					wlan_smp2p_kick();
++					printf("SWEET WLAN: t=%u ms answered IPA "
++					    "query %08x\n", i2, v);
++				}
++				ipa_last = v;
++			}
++			if (ready) {
++				break;
++			}
++			wlan_wait(1);
++		}
++		printf("SWEET WLAN: SMP2P watch done, slave-kernel %08x %s\n",
++		    sk_last, ready ? "READY" : "not ready");
++	}
+ 	printf("SWEET WLAN: F2 probe done\n");
+ }
+ 
