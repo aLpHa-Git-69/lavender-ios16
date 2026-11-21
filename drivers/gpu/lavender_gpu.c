@@ -1230,6 +1230,7 @@ step13_compute(int mode)
 		0x0e80u, 0x0ec1u, 0x0f01u,
 	};
 	vm_offset_t sh_va = 0;
+	vm_offset_t cb = smmu_va + 0x4000u + SMMU_CB * 0x1000u;	/* GPU context bank 4 */
 	uint64_t sh_pa = 0, out_pa = mode ? rptr_pa + 0x240 : fence_pa + 0x40;
 	/* mode 2 loads the word the step 13 shader stored (written by the GPU), not a CPU written one */
 	uint64_t in_pa = mode == 3 ? fence_pa + 0x40 : rptr_pa + 0x200;
