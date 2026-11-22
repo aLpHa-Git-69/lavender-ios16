@@ -131,7 +131,7 @@ def test_prepare(td):
         assert rootfs.load_plist(root, f"{rootfs.PREFS}/{name}.plist")["LastSystemVersion"] == "20H392"
         assert any(Path(call.args[0]) == path and call.args[1:] == (501, 501)
                    for call in chown.call_args_list)
-    assert rootfs.image_path(root, "usr/lib/dyld") == root / "private/preboot/Cryptexes/OS/usr/lib/dyld"
+    assert rootfs.image_path(root, "usr/lib/dyld") == root.resolve() / "private/preboot/Cryptexes/OS/usr/lib/dyld"
     assert os.readlink(root / "usr/lib/test-link") == "/usr/lib/dyld"
     assert os.path.samefile(root / "Applications/Test.app/Test",
                             root / "private/preboot/Cryptexes/App/Applications/Test.app/Test")
