@@ -18,7 +18,7 @@ shift $(( $# > 2 ? 2 : $# ))
 KEYS=("$@")
 [ ${#KEYS[@]} -eq 0 ] && KEYS=("$USER_HOME"/lavender-keys/*.pub)
 SSH_OUT="${SSH_OUT:-$USER_HOME/bergamota/research/ssh-build/out}"
-IMG2SIMG="${IMG2SIMG:-$USER_HOME/bergamota/tools/img2simg.py}"
+IMG2SIMG="${IMG2SIMG:-$HERE/img2simg.py}"
 MNT=/tmp/iosroot-ssh
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0" >&2; exit 1; }

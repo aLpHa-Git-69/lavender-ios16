@@ -159,7 +159,7 @@ The repository does not contain Apple binaries, the IPSW, the 16 GiB root image 
 
 1. **Kernel**: push a change to `xnu/patches/` (or run the workflow manually) and `.github/workflows/xnu.yml` builds `kernel.development.lavender` on `macos-15`.
 2. **Shim**: `tools/build-shim.sh <kernel>` packs the kernel, ADT and boot arguments into an Android boot image.
-3. **Root image** — extract `OS.dmg`, `SystemOS.dmg` and `AppOS.dmg` from the iPhone X 16.7.16 IPSW and build the HFSX image with `bergamota/tools/mkiosroot-macos.sh` plus `sweet-root-tweaks.py`.
+3. **Root image** — run the manual `.github/workflows/rootfs.yml` build from Termux, or use `tools/mkiosroot-macos.sh` / `tools/mkiosroot.sh` locally. Firmware extraction, root preparation and sparse conversion are included; see [`docs/ROOTFS.md`](docs/ROOTFS.md).
 4. **Flash** — `fastboot -S 512M flash userdata ios16-root.simg`, then `fastboot flash recovery shim-boot.img`, then Power + Volume Up.
 
 The exact commands, hashes and caveats are in [`docs/BUILD.md`](docs/BUILD.md).

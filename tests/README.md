@@ -26,7 +26,22 @@ The relevant files are:
 
 The 0192 test asserts that a write whose card never becomes ready returns `ETIMEDOUT` after the **30 s** `CACHE_FLUSH_TIMEOUT_NS` bound (the mock advances simulated time). The 1 s `CMD6_BUSY_TIMEOUT_NS` variant was rejected on hardware: it stopped at `cc_fips_test`.
 
-## Note
+## Rootfs tooling
+
+```bash
+python3 tests/test_rootfs.py
+python3 tests/test_img2simg.py
+```
+
+These use synthetic inputs: firmware checksum/manifest validation and extraction,
+rooted absolute-symlink resolution, cache and cryptex hard links, idempotent
+userland preparation and migration ownership requests. The sparse test decodes
+RAW/FILL chunks onto an initially non-zero target to verify exact reconstruction.
+The manual rootfs workflow runs them before building the real image on macOS.
+On Termux, run these two tests through `su`: Android's app SELinux context
+disallows creating the hard links exercised by the fixtures.
+
+## Kernel suite provenance
 
 The suite came with the series from `ios-lavender` (commit `bc606b7`). The one change is that the HakiOS checksum check is skipped, because those third-party references for another phone are not carried here. If you change a driver, run the full suite before building the kernel; CI runs it first.
 

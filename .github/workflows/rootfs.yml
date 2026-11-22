@@ -1,0 +1,75 @@
+name: lavender rootfs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rootfs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: iOS 16.7.16 HFSX rootfs
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Rootfs host checks
+        run: |
+          python3 tests/test_rootfs.py
+          python3 tests/test_img2simg.py
+          bash -n tools/mkiosroot-macos.sh tools/mkiosroot.sh
+
+      - name: Download and verify firmware
+        run: |
+          df -h "$RUNNER_TEMP"
+          python3 tools/ios_rootfs.py download "$RUNNER_TEMP/ios16.ipsw"
+
+      - name: Extract the D22AP rootfs components
+        run: |
+          python3 tools/ios_rootfs.py extract "$RUNNER_TEMP/ios16.ipsw" "$RUNNER_TEMP/ios16-input"
+          rm "$RUNNER_TEMP/ios16.ipsw"
+
+      - name: Assemble and verify the HFSX volume
+        run: |
+          sudo env "PYTHON3=$(command -v python3)" bash tools/mkiosroot-macos.sh \
+            "$RUNNER_TEMP/ios16-input/OS.dmg" \
+            "$RUNNER_TEMP/ios16-input/SystemOS.dmg" \
+            "$RUNNER_TEMP/ios16-input/AppOS.dmg" \
+            "$RUNNER_TEMP/ios16-root.img" 16g
+          rm "$RUNNER_TEMP/ios16-input/OS.dmg" \
+            "$RUNNER_TEMP/ios16-input/SystemOS.dmg" "$RUNNER_TEMP/ios16-input/AppOS.dmg"
+
+      - name: Make the flashable sparse image
+        run: |
+          mkdir -p out/rootfs
+          python3 tools/img2simg.py "$RUNNER_TEMP/ios16-root.img" out/rootfs/ios16-root.simg
+          cp "$RUNNER_TEMP/ios16-input/rootfs-source.json" out/rootfs/
+          cd out/rootfs
+          shasum -a 256 ios16-root.simg rootfs-source.json > SHA256SUMS
+          ls -lh
+
+      - name: Build summary
+        run: |
+          {
+            echo '### Lavender iOS 16.7.16 (20H392) rootfs'
+            echo '16 GiB raw HFSX volume; artifact contains the Android sparse image.'
+            echo 'Mount, ownership, dyld, userland preparation and fsck checks passed.'
+            echo 'Download `lavender-rootfs-20H392` and verify `SHA256SUMS`.'
+            echo 'Device boot verification follows flashing; see docs/ROOTFS.md.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lavender-rootfs-20H392
+          path: out/rootfs/
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 3

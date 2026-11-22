@@ -118,10 +118,10 @@ The 1 s timeout shim and the `cs_debug=2`/kprintf-spam shim are diagnostic build
 
 ## 3. Root image (HFSX)
 
-The root image is built from the iPhone X IPSW with `bergamota/tools/mkiosroot-macos.sh` and `tools/sweet-root-tweaks.py`. It is a 16 GiB HFSX image; `img2simg.py` converts it to the Android sparse image flashed to `userdata`.
+The root image is built from the iPhone X IPSW with the included `tools/mkiosroot-macos.sh` (or the Linux `tools/mkiosroot.sh`). Both apply and check the userland preparation. It is a 16 GiB HFSX image; `tools/img2simg.py` converts it to the Android sparse image flashed to `userdata`. For a Termux-controlled macOS Actions build, firmware extraction and first-boot debugging, see [`ROOTFS.md`](ROOTFS.md).
 
 ```bash
-# macOS, from the bergamota tree
+# macOS, from this repository, with the three DMGs already extracted
 sudo bash tools/mkiosroot-macos.sh \
   OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16g
 python3 tools/img2simg.py ios16-root.img ios16-root.simg
@@ -136,7 +136,7 @@ The base `sweet-root-tweaks.py` prepares the iOS root. This port adds one file t
 }
 ```
 
-`tools/fix-datamigration.sh` mounts the raw image read-write, creates the plist (501:501, 0600), verifies it with `plutil`, unmounts and regenerates the sparse image. The first boot still performs the migration because the fresh root has no migrated data; later boots should skip it. See `docs/TROUBLESHOOTING.md`.
+The builders now create both migration plists directly. `tools/fix-datamigration.sh` can update an older raw image: it mounts the image read-write, creates the DataMigration plist (501:501, 0600), verifies it with `plutil`, unmounts and regenerates the sparse image. The first boot still performs the migration because the fresh root has no migrated data; later boots should skip it. See `docs/TROUBLESHOOTING.md`.
 
 Known-good root images (not distributed):
 

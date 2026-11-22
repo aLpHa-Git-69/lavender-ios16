@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the SWEET iOS root: one case-sensitive HFS+ image holding an iOS OS
-# root filesystem plus its cryptexes, for the userdata partition (rd=ufsroot0).
+# root filesystem plus its cryptexes, for the userdata partition (rd=emmcroot0).
 #
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
 #
@@ -17,6 +17,7 @@
 # /private/var/keybags/systembag.kb is the plain-plist system keybag that
 # keybagd reads with /defaults/no-effaceable-storage (tools/mkadt.py).
 set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
@@ -112,6 +113,8 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
 
+# Apply and check the same userland fixes used by the macOS builder.
+sudo python3 "$HERE/ios_rootfs.py" prepare "$work/root"
 df -h "$work/root"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)

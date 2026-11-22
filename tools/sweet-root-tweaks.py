@@ -48,6 +48,11 @@ def save(path, data, uid, gid, mode, fmt=plistlib.FMT_BINARY):
 def merge_pref(root, name, values):
     """Merge keys into /var/mobile/Library/Preferences/NAME.plist (mobile, 0600)."""
     path = os.path.join(root, 'private/var/mobile/Library/Preferences', name + '.plist')
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        os.makedirs(parent)
+        os.chown(parent, MOBILE, MOBILE)
+        os.chmod(parent, 0o755)
     data = load(path) if os.path.exists(path) else {}
     data.update(values)
     save(path, data, MOBILE, MOBILE, 0o600)
@@ -133,6 +138,7 @@ def main():
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
+    merge_pref(root, 'com.apple.DataMigration', {'LastSystemVersion': BUILD})
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},

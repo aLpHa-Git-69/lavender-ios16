@@ -7,6 +7,16 @@
 | `fix-datamigration.sh` | macOS/root: add `com.apple.DataMigration.plist` (`LastSystemVersion=20H392`) to the raw HFSX image and regenerate the sparse image |
 | `usbnet-windows.ps1` | Windows host side of the USB network (patch `0213`): find the NCM adapter, set 192.168.7.1/24, open UDP 5140 on it, ping the phone, print/save the live kernel log (elevated PowerShell) |
 | `build-shim.sh` | Build a lavender shim from a base checkout + kernel with the known-good boot args |
+| `ios_rootfs.py` | Download/verify the pinned IPSW, select the D22AP DMGs from its manifest, prepare and check a mounted root |
+| `mkiosroot-macos.sh`, `mkiosroot.sh` | Build the journaled HFSX root on macOS or Linux, including userland fixes |
+| `img2simg.py` | Stream a raw image into Android sparse v1, preserving zero blocks with FILL chunks |
+
+## Rootfs from Termux
+
+Run `.github/workflows/rootfs.yml` on your fork with `gh workflow run rootfs.yml --ref main`.
+The macOS runner downloads the verified iPhone X 20H392 firmware and produces
+the `lavender-rootfs-20H392` artifact. See [`docs/ROOTFS.md`](../docs/ROOTFS.md)
+for download, local build, rooted Android USB-host flashing and boot-log commands.
 
 ## Log pull
 
@@ -28,7 +38,7 @@ A header-only log (`total 0`, `flush #0`) means the eMMC write path never flushe
 
 ## DataMigration helper
 
-On the Mac, with the raw image at `~/ios16-root.img` and `bergamota` at `~/bergamota`:
+On the Mac, with the raw image at `~/ios16-root.img`:
 
 ```bash
 sudo bash fix-datamigration.sh

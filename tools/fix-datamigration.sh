@@ -12,6 +12,8 @@ if [ -n "${SUDO_USER:-}" ]; then
 fi
 IMG="${1:-$USER_HOME/ios16-root.img}"
 OUT="${2:-$USER_HOME/ios16-root-dm.simg}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+IMG2SIMG="${IMG2SIMG:-$HERE/img2simg.py}"
 MNT=/tmp/iosroot-dm
 
 if [ "$(id -u)" != "0" ]; then
@@ -22,8 +24,8 @@ if [ ! -f "$IMG" ]; then
 	echo "missing image: $IMG" >&2
 	exit 1
 fi
-if [ ! -f "$USER_HOME/bergamota/tools/img2simg.py" ]; then
-	echo "missing $USER_HOME/bergamota/tools/img2simg.py" >&2
+if [ ! -f "$IMG2SIMG" ]; then
+	echo "missing $IMG2SIMG" >&2
 	exit 1
 fi
 
@@ -34,7 +36,7 @@ fi
 trap 'hdiutil detach "$MNT" >/dev/null 2>&1 || true' EXIT
 
 echo "attaching $IMG read-write at $MNT"
-hdiutil attach -readwrite -nobrowse -mountpoint "$MNT" "$IMG"
+hdiutil attach -readwrite -nobrowse -owners on -mountpoint "$MNT" "$IMG"
 
 if [ -d "$MNT/private/var" ]; then
 	P="$MNT/private/var/mobile/Library/Preferences"
@@ -71,7 +73,7 @@ hdiutil detach "$MNT"
 trap - EXIT
 
 echo "regenerating sparse image: $OUT"
-python3 "$USER_HOME/bergamota/tools/img2simg.py" "$IMG" "$OUT"
+python3 "$IMG2SIMG" "$IMG" "$OUT"
 shasum -a 256 "$IMG" "$OUT"
 ls -lh "$IMG" "$OUT"
 echo DATAMIGRATION_FIX_DONE
