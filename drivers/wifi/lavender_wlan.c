@@ -1764,13 +1764,15 @@ wlan_svc_announce(void)
 	printf("SWEET WLAN: announced tftp %u:1 port %x\n", TFTP_SVC,
 	    PORT_TFTP);
 	if (lavender_modem_rmtfs_buf(&pa, &bsz) == 0) {
-		wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL,
-		    q_modem_node, QRTR_PORT_CTRL, &r, sizeof(r));
-		printf("SWEET WLAN: announced rmtfs %u:1 port %x buffer %08llx\n",
-		    RMTFS_SVC, PORT_RMTFS, (unsigned long long)pa);
+		printf("SWEET WLAN: rmtfs buffer ready at %08llx\n",
+		    (unsigned long long)pa);
 	} else {
-		printf("SWEET WLAN: rmtfs buffer unavailable, not announced\n");
+		printf("SWEET WLAN: rmtfs buffer unavailable\n");
 	}
+	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
+	    QRTR_PORT_CTRL, &r, sizeof(r));
+	printf("SWEET WLAN: announced rmtfs %u:1 port %x\n", RMTFS_SVC,
+	    PORT_RMTFS);
 }
 
 static boolean_t

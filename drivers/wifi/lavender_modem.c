@@ -1016,16 +1016,22 @@ int
 lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size)
 {
 	if (!g_rmtfs_ready) {
+		int r;
+
 		g_rmtfs_va = ml_io_map_wcomb((vm_offset_t)RMTFS_BUF_PA,
 		    RMTFS_BUF_SIZE);
+		printf("SWEET MODEM: rmtfs buf %08llx map %s va %08x\n",
+		    (unsigned long long)RMTFS_BUF_PA,
+		    g_rmtfs_va != 0 ? "ok" : "FAILED", (uint32_t)g_rmtfs_va);
 		if (g_rmtfs_va == 0) {
-			printf("SWEET MODEM: rmtfs buffer map failed\n");
 			return ENOMEM;
 		}
 		io_zero(g_rmtfs_va, RMTFS_BUF_SIZE);
-		if (scm_assign((uint32_t)RMTFS_BUF_PA, RMTFS_BUF_SIZE,
-		    VMID_HLOS, VMID_MSS_MSA, PERM_READ | PERM_WRITE) != 0) {
-			printf("SWEET MODEM: rmtfs buffer assign failed\n");
+		r = scm_assign((uint32_t)RMTFS_BUF_PA, RMTFS_BUF_SIZE,
+		    VMID_HLOS, VMID_MSS_MSA, PERM_READ | PERM_WRITE);
+		printf("SWEET MODEM: rmtfs buf %08llx assign to MSS ret %d\n",
+		    (unsigned long long)RMTFS_BUF_PA, r);
+		if (r != 0) {
 			return EIO;
 		}
 		g_rmtfs_ready = TRUE;
@@ -1099,7 +1105,7 @@ fat_read_blob(const char *name, uint32_t pa, uint32_t want)
 			used = 0;
 		}
 		n = MIN(size - off, fat_cluster_bytes);
-		if (used == 0 || (used & 0xffff) == 0) {
+		if (used == 0 || (used & 0xfffff) == 0) {
 			printf("SWEET MODEM: %s read %u/%u\n", name, off, size);
 		}
 		err = emmc_read(MODEM_LBA + fat_cluster_sector(cluster),
