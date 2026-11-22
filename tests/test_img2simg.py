@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check sparse output using an independent decoder and a dirty target device."""
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -51,6 +52,11 @@ def main():
         decoded, kinds = expand(target.read_bytes())
         assert decoded == raw, "sparse flash did not reproduce zeros on a dirty device"
         assert set(kinds) == {0xCAC1, 0xCAC2}, kinds
+        # On an Android/Linux host, also check AOSP's actual sparse reader.
+        if reader := shutil.which("simg2img"):
+            aosp = Path(td) / "aosp.img"
+            subprocess.run([reader, str(target), str(aosp)], check=True)
+            assert aosp.read_bytes() == raw, "AOSP did not reconstruct the original image"
 
         original = target.read_bytes()
         result = run(source, target)

@@ -88,5 +88,8 @@ sync
 umount "$WORK/root"
 # Read-only verification is fatal; never publish an image with a broken catalog.
 fsck_hfs -fn "${ROOT_DEVICE/disk/rdisk}"
+# mkfile creates a root-only container; allow the caller to convert the image.
+# This changes the host file, not ownership inside the HFSX filesystem.
+chmod 0644 "$OUT"
 COMPLETE=1
 echo "root image built and checked: $OUT"
