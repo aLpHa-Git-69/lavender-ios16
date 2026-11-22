@@ -1372,6 +1372,8 @@ static struct {
 	boolean_t open;
 	char part[16];
 } rmtfs_caller[4];
+static uint64_t rmtfs_stage_pa;
+static uint32_t rmtfs_stage_size;
 
 static const uint8_t *wlan_qm_find(const uint8_t *d, uint32_t len,
     uint8_t type, uint16_t *tlen);
@@ -1494,11 +1496,23 @@ wlan_rmtfs_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
 		    rmtfs_caller[caller].open;
 		n = ok ? iov[0] : 0;
 		for (uint32_t k = 0; ok && k < n; k++) {
-			uint32_t e[3], off, bytes, done = 0;
+			uint32_t e[3], off, bytes, done = 0, buf_off;
 
 			memcpy(e, iov + 1 + 12 * k, sizeof(e));
 			off = e[0] * RMTFS_SECTOR;
 			bytes = e[2] * RMTFS_SECTOR;
+			/*
+			 * e[1] is the absolute physical address inside the
+			 * staging buffer the modem got from ALLOC_BUFF; the
+			 * copy helper takes an offset into it.
+			 */
+			if (e[1] < rmtfs_stage_pa ||
+			    (uint64_t)e[1] + bytes >
+			    rmtfs_stage_pa + rmtfs_stage_size) {
+				ok = FALSE;
+				break;
+			}
+			buf_off = (uint32_t)((uint64_t)e[1] - rmtfs_stage_pa);
 			if (k == 0) {
 				first = e[0];
 			}
@@ -1510,7 +1524,7 @@ wlan_rmtfs_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
 
 				if (dir[0] != 0) {
 					r = lavender_modem_rmtfs_copy(
-					    e[1] + done, t_pkt, n2, FALSE);
+					    buf_off + done, t_pkt, n2, FALSE);
 					if (r == (int)n2) {
 						r = lavender_modem_part_write(
 						    rmtfs_caller[caller].part,
@@ -1522,7 +1536,7 @@ wlan_rmtfs_rx(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
 					    off + done, t_pkt, n2);
 					if (r == (int)n2) {
 						r = lavender_modem_rmtfs_copy(
-						    e[1] + done, t_pkt, n2,
+						    buf_off + done, t_pkt, n2,
 						    TRUE);
 					}
 				}
@@ -1764,9 +1778,13 @@ wlan_svc_announce(void)
 	printf("SWEET WLAN: announced tftp %u:1 port %x\n", TFTP_SVC,
 	    PORT_TFTP);
 	if (lavender_modem_rmtfs_buf(&pa, &bsz) == 0) {
+		rmtfs_stage_pa = pa;
+		rmtfs_stage_size = bsz;
 		printf("SWEET WLAN: rmtfs buffer ready at %08llx\n",
 		    (unsigned long long)pa);
 	} else {
+		rmtfs_stage_pa = 0;
+		rmtfs_stage_size = 0;
 		printf("SWEET WLAN: rmtfs buffer unavailable\n");
 	}
 	wlan_qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node,
