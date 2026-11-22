@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/lavender_modem.c b/bsd/dev/lavender_modem.c
+index 1f2f871..4420f91 100644
+--- a/bsd/dev/lavender_modem.c
++++ b/bsd/dev/lavender_modem.c
+@@ -816,8 +816,7 @@ lavender_modem_fw_read(const char *name, uint32_t off, void *dst, uint32_t len)
+ #define PART_MAX        4
+ #define PART_MAX_SIZE   (16u << 20)
+ #define PART_CHUNK      (512u << 10)
+-#define RMTFS_BUF_PA    0x92000000ull
+-#define RMTFS_BUF_SIZE  0x200000u
++#define RMTFS_BUF_SIZE  0x300000u       /* 3 MiB, like qcom,rmtfs_sharedmem */
+ 
+ struct part_copy {
+ 	boolean_t used;
+@@ -829,6 +828,7 @@ struct part_copy {
+ 
+ static struct part_copy g_parts[PART_MAX];
+ static vm_offset_t g_rmtfs_va;
++static uint32_t g_rmtfs_pa;
+ static boolean_t g_rmtfs_ready;
+ 
+ static uint64_t
+@@ -1007,38 +1007,51 @@ lavender_modem_part_write(const char *name, uint32_t off, const void *src,
+ }
+ 
+ /*
+- * The modem stages rmtfs transfers in this buffer. 0x92000000 sits inside
+- * modem_fw_region (0x8ac00000+0x7e00000), past the last loaded segment; F1's
+- * reclaim hands exactly this 2 MiB chunk back to the HLOS, so the hypervisor
+- * already accepts an assign between the two VMs here.
++ * The modem stages rmtfs transfers in this buffer. Like topaz, take it from
++ * the kernel's contiguous pool and hand it to HLOS and the MSS: the modem
++ * needs to read it and the AP has to keep writing it for RW_IOVEC.
+  */
+ int
+ lavender_modem_rmtfs_buf(uint64_t *pa, uint32_t *size)
+ {
+ 	if (!g_rmtfs_ready) {
++		uint32_t src[1] = { VMID_HLOS };
++		uint32_t dst[2] = { VMID_HLOS, VMID_MSS_MSA };
++		uint32_t perm[2] = { PERM_READ | PERM_WRITE,
++		    PERM_READ | PERM_WRITE };
++		vm_offset_t va = 0;
++		uint32_t pa32;
+ 		int r;
+ 
+-		g_rmtfs_va = ml_io_map_wcomb((vm_offset_t)RMTFS_BUF_PA,
+-		    RMTFS_BUF_SIZE);
+-		printf("SWEET MODEM: rmtfs buf %08llx map %s va %08x\n",
+-		    (unsigned long long)RMTFS_BUF_PA,
+-		    g_rmtfs_va != 0 ? "ok" : "FAILED", (uint32_t)g_rmtfs_va);
+-		if (g_rmtfs_va == 0) {
++		if (kmem_alloc_contig(kernel_map, &va, RMTFS_BUF_SIZE,
++		    PAGE_MASK, 0xff000, 0, KMA_DATA | KMA_ZERO,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || va == 0) {
++			printf("SWEET MODEM: rmtfs buf alloc failed\n");
+ 			return ENOMEM;
+ 		}
+-		io_zero(g_rmtfs_va, RMTFS_BUF_SIZE);
+-		r = scm_assign((uint32_t)RMTFS_BUF_PA, RMTFS_BUF_SIZE,
+-		    VMID_HLOS, VMID_MSS_MSA, PERM_READ | PERM_WRITE);
+-		printf("SWEET MODEM: rmtfs buf %08llx assign to MSS ret %d\n",
+-		    (unsigned long long)RMTFS_BUF_PA, r);
++		pa32 = (uint32_t)pmap_find_phys(kernel_pmap,
++		    (addr64_t)va) << PAGE_SHIFT;
++		printf("SWEET MODEM: rmtfs buf va %08x pa %08x alloc ok\n",
++		    (uint32_t)va, pa32);
++		if (pa32 == 0 || pa32 + RMTFS_BUF_SIZE < pa32) {
++			printf("SWEET MODEM: rmtfs buf pa out of range\n");
++			kmem_free(kernel_map, va, RMTFS_BUF_SIZE);
++			return EINVAL;
++		}
++		r = scm_mem_assign(pa32, RMTFS_BUF_SIZE, src, 1, dst, perm, 2);
++		printf("SWEET MODEM: rmtfs buf %08x assign HLOS+MSS ret %d\n",
++		    pa32, r);
+ 		if (r != 0) {
++			kmem_free(kernel_map, va, RMTFS_BUF_SIZE);
+ 			return EIO;
+ 		}
++		g_rmtfs_va = va;
++		g_rmtfs_pa = pa32;
+ 		g_rmtfs_ready = TRUE;
+-		printf("SWEET MODEM: rmtfs buffer %08llx+%x assigned to MSS\n",
+-		    (unsigned long long)RMTFS_BUF_PA, RMTFS_BUF_SIZE);
++		printf("SWEET MODEM: rmtfs buffer %08x+%x ready\n", pa32,
++		    RMTFS_BUF_SIZE);
+ 	}
+-	*pa = RMTFS_BUF_PA;
++	*pa = g_rmtfs_pa;
+ 	*size = RMTFS_BUF_SIZE;
+ 	return 0;
+ }
