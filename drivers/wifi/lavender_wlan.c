@@ -1682,14 +1682,19 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 {
 	static const struct {
 		const char *svc, *domain;
+		uint32_t inst;
 	} map[] = {
-		{ "tms/servreg",       "msm/modem/root_pd" },
-		{ "tms/pdr_enabled",   "msm/modem/root_pd" },
-		{ "tms/pddump_disabled", "msm/modem/root_pd" },
-		{ "gps/gps_service",   "msm/modem/root_pd" },
-		{ "kernel/elf_loader", "msm/modem/wlan_pd" },
-		{ "tms/servreg",       "msm/modem/wlan_pd" },
-		{ "wlan/fw",           "msm/modem/wlan_pd" },
+		/*
+		 * Same table as bergamota boot 43: pddump_disabled and
+		 * pdr_enabled must answer 0 domains, or the modem's PDR
+		 * never asks for kernel/elf_loader (and never starts the
+		 * WLAN PD).
+		 */
+		{ "tms/servreg",       "msm/modem/root_pd", 180 },
+		{ "kernel/elf_loader", "msm/modem/wlan_pd", 180 },
+		{ "tms/servreg",       "msm/modem/wlan_pd", 180 },
+		{ "wlan/fw",           "msm/modem/wlan_pd", 180 },
+		{ "avs/audio",         "msm/adsp/audio_pd", 74 },
 	};
 	struct qmsg m;
 	char name[80];
@@ -1710,7 +1715,7 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
 	wlan_qm_string(d, len, 1, name, sizeof(name));
 	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
 		if (wlan_streq(map[i].svc, name)) {
-			uint32_t dl = 0, inst = 180, zero = 0;
+			uint32_t dl = 0, inst = map[i].inst, zero = 0;
 
 			while (map[i].domain[dl] != 0) {
 				dl++;
