@@ -2684,6 +2684,11 @@ lav_service_start(void)
 	lav_svc_ready = 1;
 	LavenderGPUStart();
 	printf("LAVGPU: service: started\n");
+	/* the live log can start late: repeat the state for a while */
+	for (int i = 0; i < 90; i++) {
+		lav_wait(10000);
+		printf("LAVGPU: service alive (%d): streams %u, ready %d\n", i, lav_svc_seq, lav_svc_ready);
+	}
 }
 
 static void
