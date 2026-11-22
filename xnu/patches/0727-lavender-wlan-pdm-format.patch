@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/lavender_wlan.c b/bsd/dev/lavender_wlan.c
+index 5196681..1331f88 100644
+--- a/bsd/dev/lavender_wlan.c
++++ b/bsd/dev/lavender_wlan.c
+@@ -1694,7 +1694,7 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
+ 	struct qmsg m;
+ 	char name[80];
+ 	uint8_t list[256];
+-	uint32_t n = 2, cnt = 0;
++	uint32_t n = 1, cnt = 0;
+ 
+ 	wlan_qm_init(&m, txn, msg);
+ 	if (msg != 0x21) {
+@@ -1730,21 +1730,17 @@ wlan_pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg,
+ 		}
+ 	}
+ 	/*
+-	 * TLV 18 is QMI_OPT_FLAG (domain_list_valid) + QMI_DATA_LEN (count as
+-	 * one byte) + the entries, per servreg_loc_get_domain_list_resp_ei.
+-	 * 0717 sent only [count][entries] (the topaz layout).
++	 * servreg_loc_get_domain_list_resp_ei as bergamota 1115 sends it:
++	 * TLV 0x10 u16 total_domains, TLV 0x11 u16 db_revision, TLV 0x12
++	 * [u8 count][entries]. No QMI_OPT_FLAG prefixes: the 0720 "validity
++	 * byte" was added while rmtfs was still missing and broke the parser.
+ 	 */
+-	/*
+-	 * TLVs 16 and 17 are QMI_OPT_FLAG + value too: the modem rejected the
+-	 * 0719 response because these two lacked the leading validity byte.
+-	 */
+-	list[0] = cnt != 0 ? 1 : 0;
+-	list[1] = (uint8_t)cnt;
++	list[0] = (uint8_t)cnt;
+ 	wlan_qm_result(&m, TRUE);
+ 	{
+-		uint8_t t16[3] = { 1, (uint8_t)(cnt & 0xff),
++		uint8_t t16[2] = { (uint8_t)(cnt & 0xff),
+ 		    (uint8_t)(cnt >> 8) };
+-		uint8_t t17[3] = { 1, 1, 0 };
++		uint8_t t17[2] = { 1, 0 };
+ 
+ 		wlan_qm_tlv(&m, 0x10, t16, sizeof(t16));
+ 		wlan_qm_tlv(&m, 0x11, t17, sizeof(t17));
