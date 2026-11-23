@@ -44,16 +44,24 @@
  * The probe is read-mostly on purpose: with no reset pulse it does not touch
  * GPIO 66/67 at all, so the log still describes the state ABL handed over.
  */
-#if defined(ARM64_BOARD_CONFIG_WHYRED)
+/* The shared entry point also builds as an unsupported-board stub. */
+#include <sys/errno.h>
+
+int santoni_touch_probe(void);
+
+#if defined(ARM64_BOARD_CONFIG_WHYRED) || defined(ARM64_BOARD_CONFIG_LAVENDER)
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/errno.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <vm/memory_types.h>
 #include <vm/pmap.h>
+
+extern void sweet_hid_touch(int finger, int down, int x, int y);
 
 /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
@@ -73,8 +81,8 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
 #define WHYRED_RST		66
 #define WHYRED_IRQ		67
 
-#define TOUCH_I2C_DELAY_US	10	/* half a bit, ~50 kHz: the internal
-					 * pull-up makes the edges slow */
+#define TOUCH_I2C_DELAY_US	10	/* half a bit, ~50 kHz: the long
+					 * 65-byte read is reliable here */
 
 static inline uint32_t
 tlmm_rd(vm_offset_t addr)
@@ -162,10 +170,52 @@ pin_read(struct touch_pin *p)
  */
 #define TOUCH_LINE_WAIT_US	2000
 
+/*
+ * 0230: busy-wait timing for the bit-bang. delay() on this port never spins:
+ * XNU's ml_delay_should_spin() compares the interval with cpu_idle_latency,
+ * which comes from ml_processor_info_t.powergate_latency, and the SWEET CPU
+ * driver (0018) registers every CPU with it left at 0 - so every delay(),
+ * even delay(1), blocks the thread until a timer interrupt wakes it. A
+ * 65-byte frame costs ~1800 of them: frames took seconds, contacts were
+ * missed, a swipe came in as one down and one move, and records were torn
+ * (the firmware rewrote the buffer during the slow read). Spinning on the
+ * timebase gives the real bus rate. sweetouchus=N sets the half-bit time
+ * (default TOUCH_I2C_DELAY_US, ~50 kHz, the rate 0206 found reliable).
+ */
+static uint64_t touch_abs_per_us;
+static uint32_t touch_half_bit_us = TOUCH_I2C_DELAY_US;
+/* 0231: microseconds spent waiting for released lines to rise (pull-up) */
+static uint32_t touch_rise_us, touch_rise_n;
+
+static void
+touch_spin_us(uint32_t us)
+{
+	if (touch_abs_per_us == 0) {
+		uint64_t t = 0;
+
+		nanoseconds_to_absolutetime(1000, &t);
+		touch_abs_per_us = t ? t : 1;
+	}
+	uint64_t end = mach_absolute_time() + touch_abs_per_us * us;
+
+	while (mach_absolute_time() < end) {
+		__asm__ volatile ("yield");
+	}
+}
+
+static uint64_t
+touch_abs_to_us(uint64_t abs)
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000;
+}
+
 static void
 bb_delay(void)
 {
-	delay(TOUCH_I2C_DELAY_US);
+	touch_spin_us(touch_half_bit_us);
 }
 
 static void
@@ -186,11 +236,13 @@ sda_release(void)
 	int i;
 
 	pin_in(&touch_sda);
+	touch_rise_n++;
 	for (i = 0; i < TOUCH_LINE_WAIT_US; i++) {
 		if (pin_read(&touch_sda)) {
 			return 1;
 		}
-		delay(1);
+		touch_spin_us(1);
+		touch_rise_us++;
 	}
 	return 0;
 }
@@ -201,11 +253,13 @@ scl_release(void)
 	int i;
 
 	pin_in(&touch_scl);
+	touch_rise_n++;
 	for (i = 0; i < TOUCH_LINE_WAIT_US; i++) {
 		if (pin_read(&touch_scl)) {
 			return 1;
 		}
-		delay(1);
+		touch_spin_us(1);
+		touch_rise_us++;
 	}
 	return 0;
 }
@@ -609,6 +663,7 @@ touch_irq_setup(vm_offset_t north)
 {
 	if (!touch_irq_ready) {
 		pin_setup(&touch_irq, north, WHYRED_IRQ);
+		pin_in(&touch_irq);
 		touch_irq_ready = 1;
 	}
 }
@@ -702,7 +757,11 @@ dsx_touch_test(const struct dsx_funcs *f, uint32_t seconds)
  */
 #define WHYRED_FB_PHYS		0x9d400000ULL
 #define WHYRED_FB_WIDTH		1080u
+#if defined(ARM64_BOARD_CONFIG_LAVENDER)
+#define WHYRED_FB_HEIGHT	2340u
+#else
 #define WHYRED_FB_HEIGHT	2160u
+#endif
 #define WHYRED_FB_STRIDE	4320u	/* bytes, 32 bpp */
 
 static uint32_t
@@ -783,6 +842,648 @@ panel_report(int acks, uint8_t first)
 	    acks > 0 ? 0xff20e020 : 0xffe02020);
 }
 
+/*
+ * A 16x16 square at the reported contact, in panel-native coordinates.
+ * Diagnostic only: it shows whether the controller's x/y follow the finger.
+ */
+static void
+panel_dot(int x, int y, uint32_t colour)
+{
+	volatile uint32_t *fb = panel_map();
+	int dx, dy;
+
+	if (fb == NULL || x < 0 || y < 0 ||
+	    x >= (int)WHYRED_FB_WIDTH || y >= (int)WHYRED_FB_HEIGHT) {
+		return;
+	}
+	for (dy = -8; dy <= 8; dy++) {
+		int yy = y + dy;
+		volatile uint32_t *line;
+
+		if (yy < 0 || yy >= (int)WHYRED_FB_HEIGHT) {
+			continue;
+		}
+		line = fb + (uint64_t)yy * (WHYRED_FB_STRIDE / 4);
+		for (dx = -8; dx <= 8; dx++) {
+			int xx = x + dx;
+
+			if (xx >= 0 && xx < (int)WHYRED_FB_WIDTH) {
+				line[xx] = colour;
+			}
+		}
+	}
+}
+
+/* Raw two-byte Novatek command (register, value) at the bootloader. */
+static int
+nvt_write_cmd(uint8_t addr, uint8_t reg, uint8_t value)
+{
+	int ok = 1;
+
+	i2c_start();
+	ok &= i2c_write((uint8_t)(addr << 1));
+	ok &= i2c_write(reg);
+	ok &= i2c_write(value);
+	i2c_stop();
+	return ok ? 0 : EIO;
+}
+
+/*
+ * Firmware xdata read: select the 24-bit address with 0xFF/high/mid
+ * (nt36xxx.c nvt_get_fw_info) and then read the low register. The
+ * NT36672A EVENT_BUF_ADDR in the stock driver is 0x21C00.
+ */
+#define NVT_XDATA_BUF	0x21C00u
+#define NVT_XDATA_FWINFO	0x78u
+
+static int
+nvt_set_xdata(uint8_t addr, uint32_t xaddr)
+{
+	int ok = 1;
+
+	i2c_start();
+	ok &= i2c_write((uint8_t)(addr << 1));
+	ok &= i2c_write(0xff);
+	ok &= i2c_write((uint8_t)((xaddr >> 16) & 0xff));
+	ok &= i2c_write((uint8_t)((xaddr >> 8) & 0xff));
+	i2c_stop();
+	return ok ? 0 : EIO;
+}
+
+static int
+nvt_read_fw(uint8_t addr, uint8_t reg, uint8_t *buf, int len)
+{
+	int i, ok = 1;
+
+	i2c_start();
+	ok &= i2c_write((uint8_t)(addr << 1));
+	ok &= i2c_write(reg);
+	if (!ok) {
+		i2c_stop();
+		return EIO;
+	}
+	i2c_start();
+	ok &= i2c_write((uint8_t)((addr << 1) | 1));
+	if (!ok) {
+		i2c_stop();
+		return EIO;
+	}
+	for (i = 0; i < len; i++) {
+		buf[i] = i2c_read(i + 1 < len);
+	}
+	i2c_stop();
+	return 0;
+}
+
+static int
+nvt_read_xdata(uint8_t addr, uint32_t xaddr, uint8_t reg, uint8_t *buf,
+    int len)
+{
+	int err = nvt_set_xdata(addr, xaddr);
+
+	if (err) {
+		return err;
+	}
+	return nvt_read_fw(addr, reg, buf, len);
+}
+
+/*
+ * FWINFO at xdata 0x21C00 + 0x78 (nt36xxx.c nvt_get_fw_info): fw version
+ * and its complement, sensor grid, abs_x_max/abs_y_max and button count.
+ * max contacts is the driver's TOUCH_MAX_FINGER_NUM (10).
+ */
+static int
+nvt_params(uint8_t addr, uint8_t p[17], unsigned *max, uint32_t *w,
+    uint32_t *h)
+{
+	unsigned i;
+	int err;
+
+	for (i = 0; i < 17u; i++) {
+		p[i] = 0;
+	}
+	err = nvt_read_xdata(addr, NVT_XDATA_BUF, NVT_XDATA_FWINFO, p, 17);
+	printf("WHYRED TOUCH: nvt fwinfo err=%d: ver=%02x/%02x xnum=%u "
+	    "ynum=%u w=%u h=%u buttons=%u\n", err, p[0], p[1], p[2], p[3],
+	    ((unsigned)p[4] << 8) | p[5], ((unsigned)p[6] << 8) | p[7], p[10]);
+	if (err) {
+		return err;
+	}
+	if ((unsigned)p[0] + p[1] != 0xffu) {
+		printf("WHYRED TOUCH: nvt fwinfo invalid\n");
+		return EIO;
+	}
+	*w = ((uint32_t)p[4] << 8) | p[5];
+	*h = ((uint32_t)p[6] << 8) | p[7];
+	*max = 10;
+	if (*w == 0u || *h == 0u || *w > 4096u || *h > 4096u) {
+		return EIO;
+	}
+	return 0;
+}
+
+/*
+ * Poll the xdata event buffer for SECONDS and draw each contact. The frame
+ * is 6 bytes per slot (nt36xxx.c nvt_ts_work_func); the first slot record
+ * is at offset 0.
+ */
+static void
+nvt_poll(uint8_t addr, unsigned max, uint32_t w, uint32_t h, uint32_t seconds)
+{
+	uint8_t buf[65];
+	int last_x[10], last_y[10], last_type[10];
+	uint32_t polls = 0, reports = 0, i;
+	int irq_level, irq_edges = 0;
+	uint64_t deadline;
+
+	if (max == 0u || max > 10u) {
+		return;
+	}
+	if (seconds > 60u) {
+		seconds = 60u;
+	}
+	nanoseconds_to_deadline((uint64_t)seconds * 1000000000ULL, &deadline);
+	irq_level = touch_irq_ready ? pin_read(&touch_irq) : 1;
+	printf("WHYRED TOUCH: nvt poll irq %d\n", irq_level);
+	for (i = 0; i < 10u; i++) {
+		last_x[i] = -1;
+		last_y[i] = -1;
+		last_type[i] = -1;
+	}
+	if (nvt_set_xdata(addr, NVT_XDATA_BUF) != 0) {
+		printf("WHYRED TOUCH: nvt xdata select failed\n");
+		return;
+	}
+	while (mach_absolute_time() < deadline) {
+		int err;
+
+		if (touch_irq_ready) {
+			int level = pin_read(&touch_irq);
+
+			if (level != irq_level) {
+				irq_edges++;
+				printf("WHYRED TOUCH: nvt irq %d -> %d (edge %d)\n",
+				    irq_level, level, irq_edges);
+				irq_level = level;
+			}
+		}
+		err = nvt_read_fw(addr, 0x00, buf, (int)sizeof(buf));
+
+		if (err) {
+			printf("WHYRED TOUCH: nvt report read err=%d poll=%u\n",
+			    err, polls);
+			delay(1000);
+			polls++;
+			continue;
+		}
+		for (i = 0; i < max; i++) {
+			const uint8_t *p = buf + 6 * i;
+			unsigned slot, type, px, py;
+
+			slot = p[0] >> 3;
+			type = p[0] & 7u;
+			if (slot < 1 || slot > max) {
+				continue;
+			}
+			if (type == 3u) {
+				if (last_type[slot - 1] != 3) {
+					printf("WHYRED TOUCH: nvt slot %u release\n",
+					    slot);
+					last_type[slot - 1] = 3;
+				}
+				continue;
+			}
+			if (type != 1u && type != 2u) {
+				continue;
+			}
+			px = ((unsigned)p[1] << 4) | (p[3] >> 4);
+			py = ((unsigned)p[2] << 4) | (p[3] & 15u);
+			if (px >= w || py >= h) {
+				printf("WHYRED TOUCH: nvt slot %u type %u out of "
+				    "range %u,%u (w=%u h=%u)\n", slot, type, px,
+				    py, w, h);
+				continue;
+			}
+			reports++;
+			if (last_x[slot - 1] != (int)px ||
+			    last_y[slot - 1] != (int)py ||
+			    last_type[slot - 1] != (int)type) {
+				printf("WHYRED TOUCH: nvt slot %u type %u x %u y %u "
+				    "raw %02x %02x %02x %02x %02x %02x\n", slot,
+				    type, px, py, p[0], p[1], p[2], p[3], p[4],
+				    p[5]);
+				last_x[slot - 1] = (int)px;
+				last_y[slot - 1] = (int)py;
+				last_type[slot - 1] = (int)type;
+			}
+			panel_dot((int)px, (int)py, 0xff0000ff);
+		}
+		delay(1000);
+		polls++;
+	}
+	printf("WHYRED TOUCH: nvt poll done polls=%u reports=%u\n", polls,
+	    reports);
+}
+
+static uint8_t touch_fw_addr;
+static uint32_t touch_max_x, touch_max_y;
+static int touch_thread_started;
+static vm_offset_t touch_north;
+
+static int
+santoni_touch_reinit(void)
+{
+	struct touch_pin rst;
+	uint8_t p[17];
+	unsigned max = 0;
+	uint32_t w = 0, h = 0;
+	uint8_t addr = 0;
+	int i;
+
+	if (touch_north == 0) {
+		return ENXIO;
+	}
+	/*
+	 * The panel DSI init leaves the NT36672A answering I2C but no longer
+	 * scanning (bergamota 1010): the probe sees event frames, the thread
+	 * that runs later sees only the down/up latches. Pulse reset after the
+	 * panel is up, then boot the firmware exactly as the probe does.
+	 */
+	pin_setup(&rst, touch_north, WHYRED_RST);
+	pin_out(&rst, 0);
+	delay(20000);
+	pin_out(&rst, 1);
+	delay(250000);
+	if (i2c_ack(0x62)) {
+		addr = 0x62;
+		if (nvt_write_cmd(addr, 0x00, 0x69) == 0) {
+			delay(35000);
+			for (i = 0; i < 100; i++) {
+				if (i2c_ack(0x01)) {
+					addr = 0x01;
+					break;
+				}
+				delay(10000);
+			}
+		}
+	} else if (i2c_ack(0x01)) {
+		addr = 0x01;
+	}
+	if (addr == 0) {
+		printf("WHYRED TOUCH: reinit no ack\n");
+		return ENXIO;
+	}
+	if (nvt_params(addr, p, &max, &w, &h) != 0) {
+		printf("WHYRED TOUCH: reinit params failed at 0x%02x\n", addr);
+		return EIO;
+	}
+	if (nvt_set_xdata(addr, NVT_XDATA_BUF) != 0) {
+		printf("WHYRED TOUCH: reinit xdata failed\n");
+		return EIO;
+	}
+	touch_fw_addr = addr;
+	touch_max_x = w;
+	touch_max_y = h;
+	printf("WHYRED TOUCH: reinit ok at 0x%02x, %ux%u\n", addr, w, h);
+	return 0;
+}
+
+/*
+ * Permanent polling thread: one xdata frame lists every active contact.
+ * A slot that is absent from the frame (or whose record is torn and out of
+ * range) is released. sweet_hid_touch is the HID sink from patch 0058.
+ */
+static void
+santoni_touch_thread(void *arg, wait_result_t wr)
+{
+	uint8_t buf[65];
+	int active[10], last_x[10], last_y[10];
+	int irq_level;
+	unsigned i;
+	/* 0230: frame/timing statistics, printed every 10 s while active */
+	uint64_t st_start = 0, st_sum = 0, st_max = 0;
+	unsigned st_frames = 0, st_full = 0, st_err = 0, st_events = 0, st_quiet = 0;
+	unsigned contacts = 0;
+	unsigned top_slot = 0;          /* 0231: highest active slot (1-based), 0 = none */
+	uint32_t idle_ms = 25;
+
+	(void)arg;
+	(void)wr;
+	(void)PE_parse_boot_argn("sweetouchidle", &idle_ms, sizeof(idle_ms));
+	if (idle_ms < 2u || idle_ms > 200u) {
+		idle_ms = 25;
+	}
+	{
+		uint32_t us = 0;
+
+		if (PE_parse_boot_argn("sweetouchus", &us, sizeof(us)) && us >= 1u && us <= 100u) {
+			touch_half_bit_us = us;
+		}
+		uint64_t t0 = mach_absolute_time();
+		for (i = 0; i < 50u; i++) {
+			delay(1);
+		}
+		uint64_t t1 = mach_absolute_time();
+		for (i = 0; i < 50u; i++) {
+			touch_spin_us(1);
+		}
+		uint64_t t2 = mach_absolute_time();
+		printf("WHYRED TOUCH: timing: 50x delay(1) = %llu us, 50x spin(1) = %llu us; "
+		    "half bit %u us\n", touch_abs_to_us(t1 - t0), touch_abs_to_us(t2 - t1),
+		    touch_half_bit_us);
+		st_start = mach_absolute_time();
+	}
+	for (i = 0; i < 10u; i++) {
+		active[i] = 0;
+		last_x[i] = 0;
+		last_y[i] = 0;
+	}
+	{
+		uint32_t reinit_s = 0;
+
+		(void)PE_parse_boot_argn("sweetouchdelay", &reinit_s,
+		    sizeof(reinit_s));
+		if (reinit_s) {
+			if (reinit_s > 600u) {
+				reinit_s = 600u;
+			}
+			printf("WHYRED TOUCH: waiting %u s for panel init\n",
+			    reinit_s);
+			delay((int)(reinit_s * 1000000u));
+			printf("WHYRED TOUCH: reinit after panel init\n");
+			(void)santoni_touch_reinit();
+			printf("WHYRED TOUCH: poll irq %d after reinit\n",
+			    touch_irq_ready ? pin_read(&touch_irq) : 1);
+		}
+	}
+	if (nvt_set_xdata(touch_fw_addr, NVT_XDATA_BUF) != 0) {
+		printf("WHYRED TOUCH: poll xdata select failed\n");
+	}
+	irq_level = touch_irq_ready ? pin_read(&touch_irq) : 1;
+	printf("WHYRED TOUCH: poll irq %d\n", irq_level);
+	for (;;) {
+		uint32_t mask = 0;
+		int err;
+
+		if (touch_irq_ready) {
+			int level = pin_read(&touch_irq);
+
+			if (level != irq_level) {
+				printf("WHYRED TOUCH: thread irq %d -> %d\n",
+				    irq_level, level);
+				irq_level = level;
+			}
+		}
+		/*
+		 * 0230: with no contact the first finger always lands in slot 1,
+		 * so 12 bytes (slots 1-2) are enough to see it; the full 65-byte
+		 * frame is read only while something is down.
+		 */
+		/*
+		 * 0231: a contact's record sits at its slot (record i = slot
+		 * i + 1), so read up to the highest active slot plus one more
+		 * record for a new finger: one finger is 12 bytes (~14 ms) instead
+		 * of the 65-byte frame (~65 ms), four to five times more reports
+		 * during a drag. 12 bytes still cover the first finger when idle.
+		 */
+		int len = 6 * (int)(top_slot + 1u);
+
+		if (len < 12) {
+			len = 12;
+		}
+		if (len > (int)sizeof(buf)) {
+			len = (int)sizeof(buf);
+		}
+		uint64_t f0 = mach_absolute_time();
+
+		err = nvt_read_fw(touch_fw_addr, 0x00, buf, len);
+		uint64_t fdt = mach_absolute_time() - f0;
+		st_frames++;
+		st_full += (len == (int)sizeof(buf));
+		st_sum += fdt;
+		if (fdt > st_max) {
+			st_max = fdt;
+		}
+		if (err) {
+			st_err++;
+		}
+
+		if (err == 0) {
+			for (i = 0; i < (unsigned)len / 6u; i++) {
+				const uint8_t *p = buf + 6 * i;
+				unsigned slot = p[0] >> 3;
+				unsigned type = p[0] & 7u;
+				unsigned px, py;
+
+				if (slot < 1u || slot > 10u) {
+					continue;
+				}
+				if (type != 1u && type != 2u) {
+					continue;
+				}
+				px = ((unsigned)p[1] << 4) | (p[3] >> 4);
+				py = ((unsigned)p[2] << 4) | (p[3] & 15u);
+				if (px >= touch_max_x || py >= touch_max_y) {
+					continue;
+				}
+				mask |= 1u << (slot - 1u);
+				if (!active[slot - 1u] ||
+				    last_x[slot - 1u] != (int)px ||
+				    last_y[slot - 1u] != (int)py) {
+					st_events++;
+					sweet_hid_touch((int)(slot - 1u), 1,
+					    (int)px, (int)py);
+					active[slot - 1u] = 1;
+					last_x[slot - 1u] = (int)px;
+					last_y[slot - 1u] = (int)py;
+				}
+			}
+			for (i = 0; i < 10u; i++) {
+				if (active[i] && !(mask & (1u << i))) {
+					st_events++;
+					sweet_hid_touch((int)i, 0, last_x[i],
+					    last_y[i]);
+					active[i] = 0;
+				}
+			}
+			contacts = 0;
+			top_slot = 0;
+			for (i = 0; i < 10u; i++) {
+				if (active[i]) {
+					contacts++;
+					top_slot = i + 1u;
+				}
+			}
+		}
+		if (mach_absolute_time() - st_start >= touch_abs_per_us * 10000000ull) {
+			/* print while touches happen, and for the first minute */
+			if (st_events || st_err || st_quiet < 6u) {
+				printf("WHYRED TOUCH: 10s frames %u (full %u) err %u avg %llu us max %llu us "
+				    "events %u contacts %u; line rise %u us per release\n", st_frames, st_full,
+				    st_err, st_frames ? touch_abs_to_us(st_sum / st_frames) : 0ull,
+				    touch_abs_to_us(st_max), st_events, contacts,
+				    touch_rise_n ? touch_rise_us / touch_rise_n : 0u);
+			}
+			st_quiet = st_events ? 0u : st_quiet + 1u;
+			st_frames = st_full = st_err = st_events = 0;
+			st_sum = st_max = 0;
+			touch_rise_us = touch_rise_n = 0;
+			st_start = mach_absolute_time();
+		}
+		/* 2 ms between reads while touched; sweetouchidle ms (25) when idle */
+		delay(contacts ? 2000 : (int)(idle_ms * 1000u));
+	}
+}
+
+static void
+santoni_touch_start_thread(void)
+{
+	thread_t thread;
+	kern_return_t kr;
+
+	if (touch_thread_started) {
+		return;
+	}
+	kr = kernel_thread_start(santoni_touch_thread, NULL, &thread);
+	if (kr != KERN_SUCCESS) {
+		printf("WHYRED TOUCH: poll thread failed %d\n", kr);
+		return;
+	}
+	touch_thread_started = 1;
+	thread_deallocate(thread);
+	printf("WHYRED TOUCH: poll thread at 0x%02x, %ux%u\n", touch_fw_addr,
+	    touch_max_x, touch_max_y);
+}
+
+/*
+ * 0221: remote touch injection over the USB NCM link. The host sends a UDP
+ * datagram to 192.168.7.2:5141 with an ASCII command prefixed by "SWEET ":
+ *   SWEET tap X Y
+ *   SWEET down X Y | move X Y | up X Y
+ *   SWEET swipe X1 Y1 X2 Y2 [MS]
+ *   SWEET key N D          (0 power, 1 vol+, 2 vol-, 3 home)
+ * Called from the USB kernel thread (ud_rx_done), so sweet_hid_touch() is
+ * safe here.
+ */
+static int
+santoni_cmd_uint(const char **pp, int *out)
+{
+	const char *p = *pp;
+	int v = 0, n = 0;
+
+	while (*p == ' ') {
+		p++;
+	}
+	while (*p >= '0' && *p <= '9') {
+		v = v * 10 + (*p - '0');
+		p++;
+		n++;
+	}
+	if (n == 0) {
+		return 0;
+	}
+	*pp = p;
+	*out = v;
+	return 1;
+}
+
+void
+santoni_touch_remote(const uint8_t *frame, uint32_t len)
+{
+	extern void sweet_hid_key(int key, int down);
+	const uint8_t *ip, *udp, *payload;
+	uint32_t ihl, udplen, plen;
+	char buf[96];
+	const char *p;
+	int x, y, x2, y2, ms, n, i;
+
+	if (len < 14 + 20 + 8 || frame[12] != 0x08 || frame[13] != 0x00) {
+		return;
+	}
+	ip = frame + 14;
+	if ((ip[0] >> 4) != 4 || ip[9] != 17) {
+		return;
+	}
+	ihl = (uint32_t)(ip[0] & 0x0f) * 4;
+	if (ihl < 20 || len < 14 + ihl + 8) {
+		return;
+	}
+	udp = ip + ihl;
+	if ((((uint32_t)udp[2] << 8) | udp[3]) != 5141) {
+		return;
+	}
+	udplen = ((uint32_t)udp[4] << 8) | udp[5];
+	if (udplen < 8 || 14 + ihl + udplen > len) {
+		return;
+	}
+	payload = udp + 8;
+	plen = udplen - 8;
+	if (plen >= sizeof(buf)) {
+		plen = sizeof(buf) - 1;
+	}
+	memcpy(buf, payload, plen);
+	buf[plen] = 0;
+	if (strncmp(buf, "SWEET ", 6) != 0) {
+		return;
+	}
+	p = buf + 6;
+	if (!strncmp(p, "down ", 5)) {
+		p += 5;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y)) {
+			sweet_hid_touch(0, 1, x, y);
+		}
+	} else if (!strncmp(p, "move ", 5)) {
+		p += 5;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y)) {
+			sweet_hid_touch(0, 1, x, y);
+		}
+	} else if (!strncmp(p, "up ", 3)) {
+		p += 3;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y)) {
+			sweet_hid_touch(0, 0, x, y);
+		}
+	} else if (!strncmp(p, "tap ", 4)) {
+		p += 4;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y)) {
+			sweet_hid_touch(0, 1, x, y);
+			delay(30000);
+			sweet_hid_touch(0, 0, x, y);
+		}
+	} else if (!strncmp(p, "swipe ", 6)) {
+		p += 6;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y) &&
+		    santoni_cmd_uint(&p, &x2) && santoni_cmd_uint(&p, &y2)) {
+			if (!santoni_cmd_uint(&p, &ms)) {
+				ms = 300;
+			}
+			if (ms < 20) {
+				ms = 20;
+			}
+			if (ms > 2000) {
+				ms = 2000;
+			}
+			n = ms / 20;
+			if (n < 2) {
+				n = 2;
+			}
+			sweet_hid_touch(0, 1, x, y);
+			for (i = 1; i <= n; i++) {
+				int ix = x + (x2 - x) * i / n;
+				int iy = y + (y2 - y) * i / n;
+
+				sweet_hid_touch(0, 1, ix, iy);
+				delay(20000);
+			}
+			sweet_hid_touch(0, 0, x2, y2);
+		}
+	} else if (!strncmp(p, "key ", 4)) {
+		p += 4;
+		if (santoni_cmd_uint(&p, &x) && santoni_cmd_uint(&p, &y)) {
+			sweet_hid_key(x, y);
+		}
+	}
+}
+
 int
 santoni_touch_probe(void)
 {
@@ -790,8 +1491,10 @@ santoni_touch_probe(void)
 	uint32_t on = 0, pulse = 0, wait, halt;
 	uint8_t id[3] = { 0, 0, 0 };
 	uint8_t first_ack = 0;
+	uint8_t nvt_addr = 0;
 	struct dsx_funcs dsx;
 	int addr, acks = 0, pulsed, saw_rmi = 0;
+	int nvt_ok = 0;
 	uint32_t touch_s;
 	uint32_t rst_cfg, rst_io, irq_cfg, irq_io;
 
@@ -812,6 +1515,7 @@ santoni_touch_probe(void)
 		    (void *)south, (void *)north);
 		return ENOMEM;
 	}
+	touch_north = north;
 
 	/* Raw reset/IRQ state before anything is touched. */
 	rst_cfg = tlmm_rd(north + TLMM_REG_SIZE * WHYRED_RST + TLMM_CTRL);
@@ -848,6 +1552,14 @@ santoni_touch_probe(void)
 		    "50 ms settle\n");
 	}
 
+	/* Firmware may already be running and need no bootloader reset. */
+	if (i2c_ack(0x01)) {
+		acks++;
+		first_ack = 0x01;
+		nvt_addr = 0x01;
+		printf("WHYRED TOUCH: ack 0x01 (Novatek firmware)\n");
+	}
+
 	for (addr = 0x08; addr <= 0x77; addr++) {
 		if (!i2c_ack((uint8_t)addr)) {
 			continue;
@@ -857,6 +1569,9 @@ santoni_touch_probe(void)
 			first_ack = (uint8_t)addr;
 		}
 		printf("WHYRED TOUCH: ack 0x%02x\n", addr);
+		if (addr == 0x62 && nvt_addr == 0) {
+			nvt_addr = (uint8_t)addr;
+		}
 		if (addr == DSX_ADDR) {
 			/* Synaptics DSX: the Novatek page protocol would only
 			 * return noise, the DSX page-table dump below is the
@@ -864,6 +1579,12 @@ santoni_touch_probe(void)
 			saw_rmi = 1;
 			continue;
 		}
+		if (addr != 0x62) {
+			printf("WHYRED TOUCH: skip non-Novatek register access "
+			    "at 0x%02x\n", addr);
+			continue;
+		}
+
 		if (nvt_read((uint8_t)addr, 0x00, 0x00, id, sizeof(id)) == 0) {
 			printf("WHYRED TOUCH: id 0x%02x %02x %02x %02x\n", addr,
 			    id[0], id[1], id[2]);
@@ -875,13 +1596,50 @@ santoni_touch_probe(void)
 	printf("WHYRED TOUCH: scan done, %d address(es) acknowledged; sda %d "
 	    "scl %d\n", acks, pin_read(&touch_sda), pin_read(&touch_scl));
 
+	if (nvt_addr == 0x62) {
+		int i;
+
+		if (nvt_write_cmd(nvt_addr, 0x00, 0x69) == 0) {
+			delay(35000);
+			for (i = 0; i < 100; i++) {
+				if (i2c_ack(0x01)) {
+					nvt_addr = 0x01;
+					break;
+				}
+				delay(10000);
+			}
+			printf("WHYRED TOUCH: nvt boot 0x69 -> addr 0x%02x "
+			    "(%d ms)\n", nvt_addr, i * 10);
+		} else {
+			printf("WHYRED TOUCH: nvt boot cmd failed\n");
+		}
+	}
+	touch_s = 0;
+	(void)PE_parse_boot_argn("sweetouchtouch", &touch_s, sizeof(touch_s));
+	if (nvt_addr != 0) {
+		touch_irq_setup(north);
+		uint8_t nvt_p[17];
+		unsigned nvt_max = 0;
+		uint32_t nvt_w = 0, nvt_h = 0;
+
+		if (nvt_params(nvt_addr, nvt_p, &nvt_max, &nvt_w, &nvt_h) == 0) {
+			nvt_ok = 1;
+			touch_fw_addr = nvt_addr;
+			touch_max_x = nvt_w;
+			touch_max_y = nvt_h;
+			if (touch_s) {
+				if (panel_report(acks, first_ack) != 0) {
+					printf("WHYRED TOUCH: panel paint failed\n");
+				}
+				nvt_poll(nvt_addr, nvt_max, nvt_w, nvt_h, touch_s);
+			}
+		}
+	}
 	if (saw_rmi) {
 		touch_irq_setup(north);
 		dsx_diag();
 		dsx_identify(&dsx);
-		touch_s = 0;
-		if (PE_parse_boot_argn("sweetouchtouch", &touch_s,
-		    sizeof(touch_s)) && touch_s) {
+		if (touch_s) {
 			dsx_touch_test(&dsx, touch_s);
 		}
 	}
@@ -921,10 +1679,13 @@ santoni_touch_probe(void)
 		printf("WHYRED TOUCH: holding the panel %u s\n", wait);
 		delay((int)(wait * 1000000u));
 	}
+	if (nvt_ok && touch_s == 0) {
+		santoni_touch_start_thread();
+	}
 	return acks ? 0 : ENXIO;
 }
 
-#else /* !ARM64_BOARD_CONFIG_WHYRED */
+#else /* !ARM64_BOARD_CONFIG_WHYRED && !ARM64_BOARD_CONFIG_LAVENDER */
 
 int
 santoni_touch_probe(void)
@@ -932,4 +1693,4 @@ santoni_touch_probe(void)
 	return ENXIO;
 }
 
-#endif /* ARM64_BOARD_CONFIG_WHYRED */
+#endif /* ARM64_BOARD_CONFIG_WHYRED || ARM64_BOARD_CONFIG_LAVENDER */

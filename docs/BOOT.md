@@ -46,6 +46,8 @@ Do **not** use `fastboot reboot recovery`. On this unit it boots Android and MIU
 | `sweetusbncm=0` | Patch `0213`: CDC-ECM instead of CDC-NCM (NCM is the default on lavender: Windows 10 2004+/11 binds UsbNcm; macOS/Linux drive both) |
 | `sweetrtcoff=N` | Patch `0220`: seconds added to the PM660 RTC raw count to get Unix time (Android never writes that RTC, it keeps its own offset). Without it the raw count is used only if it is already >= 2020-01-01; else `sweetrtc` (patch `0216`) gives the calendar. The raw value is logged as `SWEET RTC: PM660 raw …` |
 | `sweetkeys=0` | Patch `0201`: disable the PMIC key poller (default on, read-only) |
+| `sweetouchi2c=1` | Enable the lavender touch probe and the NT36672A polling thread; without this argument the probe returns before touching the bus |
+| `sweetouchwait=0` | Continue immediately after the touch probe instead of its default 15-second diagnostic hold |
 
 ## Live log over USB (patch 0200)
 

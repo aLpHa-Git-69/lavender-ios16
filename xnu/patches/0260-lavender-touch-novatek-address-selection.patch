@@ -1,0 +1,44 @@
+From: lavender-ios16 contributors
+Subject: [PATCH 0260] touch: select Novatek endpoints, not the first bus ACK
+
+The replacement NT36672A panel's boot log acknowledges 0x30 before 0x62.
+The old probe selected 0x30 as nvt_addr, read all-zero firmware information,
+and never started the poller. Only 0x01 (running firmware) and 0x62 (hardware
+endpoint) are Novatek candidates. Prefer already-running firmware and leave
+other acknowledged addresses free of Novatek register writes.
+
+diff --git a/bsd/dev/santoni_touch.c b/bsd/dev/santoni_touch.c
+--- a/bsd/dev/santoni_touch.c
++++ b/bsd/dev/santoni_touch.c
+@@ -1553,6 +1553,14 @@ santoni_touch_probe(void)
+ 	}
+ 
++	/* Firmware may already be running and need no bootloader reset. */
++	if (i2c_ack(0x01)) {
++		acks++;
++		first_ack = 0x01;
++		nvt_addr = 0x01;
++		printf("WHYRED TOUCH: ack 0x01 (Novatek firmware)\n");
++	}
++
+ 	for (addr = 0x08; addr <= 0x77; addr++) {
+ 		if (!i2c_ack((uint8_t)addr)) {
+ 			continue;
+ 		}
+@@ -1563,4 +1571,4 @@ santoni_touch_probe(void)
+ 		printf("WHYRED TOUCH: ack 0x%02x\n", addr);
+-		if (addr != DSX_ADDR && nvt_addr == 0) {
++		if (addr == 0x62 && nvt_addr == 0) {
+ 			nvt_addr = (uint8_t)addr;
+ 		}
+@@ -1571,4 +1579,10 @@ santoni_touch_probe(void)
+ 			saw_rmi = 1;
+ 			continue;
+ 		}
++		if (addr != 0x62) {
++			printf("WHYRED TOUCH: skip non-Novatek register access "
++			    "at 0x%02x\n", addr);
++			continue;
++		}
++
+ 		if (nvt_read((uint8_t)addr, 0x00, 0x00, id, sizeof(id)) == 0) {

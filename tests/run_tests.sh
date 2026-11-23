@@ -49,6 +49,14 @@ case "$OUT" in
 	*)  "./$OUT/test_gic_wait" ;;
 esac
 
+echo "== lavender touch: actual probe with the replacement panel ACK sequence =="
+"$CC" -O2 -Wall -Wextra -Werror -I"$OUT/kernel-mock" \
+	tests/test_lavender_touch_probe.c -o "$OUT/test_lavender_touch_probe"
+case "$OUT" in
+	/*) "$OUT/test_lavender_touch_probe" ;;
+	*) "./$OUT/test_lavender_touch_probe" ;;
+esac
+
 # 0193 gave LAVENDER the real Novatek driver; SANTONI still gets the stub.
 echo "== unsupported board: complete touch stub TU and shared prototype =="
 "$CC" -O2 -Wall -Wextra -Werror -Wmissing-prototypes -Wredundant-decls \
@@ -987,6 +995,8 @@ python3 tests/test_zip_partial.py >/dev/null
 echo "ok   zip_partial proves an entry before calling it the kernel"
 python3 tests/test_payload_cmdline.py >/dev/null
 echo "ok   payload_cmdline reads the line the shim really uses, not boot.img"
+python3 tests/test_repack_shim.py >/dev/null
+echo "ok   repack_shim edits only payload arguments and preserves the boot components"
 
 echo "== IMAGES: manual runs choose normal / log / both =="
 # Both images come from the same kernel; the normal one must carry no log

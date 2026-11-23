@@ -17,7 +17,7 @@ BOARD="${BOARD:-lavender}"
 ROOTDEV="${ROOTDEV:-emmcroot0}"
 
 # The lock-screen boot command line. Adjust only one variable at a time.
-EXTRA_CMDLINE="${EXTRA_CMDLINE:-sweetlog=1 emmcrw=1 rootrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_stayon=1 sweetfb_hz=30 cpus=4}"
+EXTRA_CMDLINE="${EXTRA_CMDLINE:-sweetlog=1 emmcrw=1 rootrw=1 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin sweetfb_noconsole=1 sweetfb_stayon=1 sweetfb_hz=30 cpus=4 sweetouchi2c=1 sweetouchwait=0}"
 KPRINTF_SPAM="${KPRINTF_SPAM-}"
 
 # Calendar (patches 0216/0220): sweetrtc = the build time, the fallback when

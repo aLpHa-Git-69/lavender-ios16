@@ -122,6 +122,7 @@ working bring-up configuration includes:
 rd=emmcroot0 emmcrw=1 rootrw=1
 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1
 sweetlog=1 cpus=4 wdt=-1 wdt_test=no_user_checkin
+sweetouchi2c=1 sweetouchwait=0
 ```
 
 `cpus=4` selects the four A73 Gold cores for this 16 KiB-page port. Boot the

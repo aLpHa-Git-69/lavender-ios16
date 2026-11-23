@@ -149,6 +149,7 @@ rd=emmcroot0 emmcrw=1 rootrw=1
 cs_enforcement_disable=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1
 sweetlog=1 sweetfb_noconsole=1 sweetfb_stayon=1 sweetfb_hz=30
 wdt=-1 wdt_test=no_user_checkin cpus=4
+sweetouchi2c=1 sweetouchwait=0
 ```
 
 See [`docs/BOOT.md`](docs/BOOT.md) for the full chain and the log-pull procedure.

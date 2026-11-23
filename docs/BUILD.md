@@ -84,6 +84,7 @@ cs_enforcement_disable=1 unentitled_ios_sim_launch=1 launchd_unsecure_cache=1
 wdt=-1 wdt_test=no_user_checkin
 sweetfb_noconsole=1 sweetfb_stayon=1 sweetfb_hz=30
 cpus=4
+sweetouchi2c=1 sweetouchwait=0
 ```
 
 Why these arguments:
@@ -95,6 +96,7 @@ Why these arguments:
 - `sweetfb_noconsole=1 sweetfb_stayon=1 sweetfb_hz=30` — hide the kernel console behind the GUI, keep the panel on, 30 Hz software composition.
 - `wdt=-1 wdt_test=no_user_checkin` — do not let the watchdog reboot the bring-up.
 - `cpus=4` — all four Gold A73 cores. `cpus=1` is the safe fallback; the Silver A53 cores cannot run 16 KiB pages.
+- `sweetouchi2c=1 sweetouchwait=0` — start the Novatek touch probe/poller and skip its 15-second diagnostic hold.
 
 Verify the payload command line and the board:
 

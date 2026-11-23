@@ -41,6 +41,17 @@ The manual rootfs workflow runs them before building the real image on macOS.
 On Termux, run these two tests through `su`: Android's app SELinux context
 disallows creating the hard links exercised by the fixtures.
 
+## Shim command-line repacking
+
+`test_lavender_touch_probe.c`, run by the main suite, compiles the actual
+patched `santoni_touch_probe()` against a mocked bus. It reproduces the
+replacement panel's `0x30`/`0x62` ACK sequence and checks that only the
+Novatek endpoint is booted/read and the poller starts with firmware `0x01`.
+
+`python3 tests/test_repack_shim.py` checks that editing a candidate shim's
+payload arguments preserves all kernel/ADT bytes outside that field, the
+appended DTB, ramdisk and second stage, and recomputes the Android component ID.
+
 ## Kernel suite provenance
 
 The suite came with the series from `ios-lavender` (commit `bc606b7`). The one change is that the HakiOS checksum check is skipped, because those third-party references for another phone are not carried here. If you change a driver, run the full suite before building the kernel; CI runs it first.

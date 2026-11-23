@@ -10,6 +10,7 @@
 | `ios_rootfs.py` | Download/verify the pinned IPSW, select the D22AP DMGs from its manifest, prepare and check a mounted root |
 | `mkiosroot-macos.sh`, `mkiosroot.sh` | Build the journaled HFSX root on macOS or Linux, including userland fixes |
 | `img2simg.py` | Stream a raw image into Android sparse v1, preserving zero blocks with FILL chunks |
+| `repack-shim-cmdline.py` | Make an Android v0 candidate shim with edited payload boot arguments; preserves kernel/ADT, appended DTB, ramdisk and second stage |
 
 ## Rootfs from Termux
 
@@ -54,7 +55,7 @@ tools/build-shim.sh /path/to/kernel.development.lavender
 # -> shim/out/shim-boot.img
 ```
 
-The default command line is the lock-screen build: `rd=emmcroot0`, `emmcrw=1 rootrw=1`, the CS flags, `sweetlog=1`, the GUI switches and `cpus=4`. Override `EXTRA_CMDLINE` to test a different configuration.
+The default command line is the lock-screen build: `rd=emmcroot0`, `emmcrw=1 rootrw=1`, the CS flags, `sweetlog=1`, the GUI switches, `cpus=4` and `sweetouchi2c=1 sweetouchwait=0`. The touch enable flag is required by `santoni_touch_probe()`; the wait flag removes its diagnostic 15-second hold. Override `EXTRA_CMDLINE` to test a different configuration.
 
 `shim/build.sh` uses `resources/lavender_dtb.bin` (tracked) and the product ADT (`d22ap.adt` from the iPhone X IPSW). The ADT is Apple's and is not distributed here.
 

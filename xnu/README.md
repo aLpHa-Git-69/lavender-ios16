@@ -80,6 +80,11 @@ WLAN/modem block.
 
 ## Changing the series
 
+`0260-lavender-touch-novatek-address-selection.patch` fixes a replacement
+NT36672A panel that ACKs `0x30` before `0x62`: the probe now selects only
+Novatek's `0x01`/`0x62` endpoints. Its host regression uses the real probe
+body; see `docs/TOUCH-BRINGUP.md` for the device evidence.
+
 ```bash
 # after adding or editing a patch
 python3 tools/extract_drivers.py      # refresh drivers/ mirrors (generated, never edited by hand)

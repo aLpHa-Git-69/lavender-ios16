@@ -120,6 +120,15 @@ def prepare(out, source_tree):
     # Compile this COMPLETE source as a separate TU: a header included by the
     # test harness must not hide a missing include in the Lavender stub.
     (out / "santoni_touch.c").write_text(touch)
+    # Exercise the real address-selection/control flow with a mocked bus.
+    # The unsupported-board definition is a separate branch, not the probe.
+    probe_source = touch.split("#else /* !ARM64_BOARD_CONFIG_WHYRED", 1)[0]
+    probe_source = probe_source.replace("\nint\nsantoni_touch_probe(",
+                                        "\nstatic int\nsantoni_touch_probe(")
+    _, probe = function(probe_source, "santoni_touch_probe")
+    probe = probe.replace("static int\nsantoni_touch_probe(",
+                          "int\nsantoni_touch_probe(", 1)
+    (out / "touch_probe_mock_impl.h").write_text(probe + "\n")
     print(f"ok   compiled mocks use {len(selected)} actual SDHCI functions and gicd_wait_rwp")
 
 
