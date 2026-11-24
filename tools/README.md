@@ -10,7 +10,24 @@
 | `ios_rootfs.py` | Download/verify the pinned IPSW, select the D22AP DMGs from its manifest, prepare and check a mounted root |
 | `mkiosroot-macos.sh`, `mkiosroot.sh` | Build the journaled HFSX root on macOS or Linux, including userland fixes |
 | `img2simg.py` | Stream a raw image into Android sparse v1, preserving zero blocks with FILL chunks |
-| `repack-shim-cmdline.py` | Make an Android v0 candidate shim with edited payload boot arguments; preserves kernel/ADT, appended DTB, ramdisk and second stage |
+| `repack-shim-cmdline.py` | Make an Android v0 candidate shim with edited payload boot arguments; optional `--kernel` packs a rebuilt kernel using the image's working board ADT and shim prefix |
+| `lavender-rescue.S` | Experimental static PID 1 for a read-only HFSX preference inspection boot; device inspection remains unverified |
+
+### Kernel and payload-RAMDisk repacking
+
+`repack-shim-cmdline.py --kernel` preserves the working board properties and
+the embedded RAMDisk contents, relocating the RAMDisk after the rebuilt
+kernel. `--ramdisk` explicitly supplies another payload RAMDisk and requires
+`--kernel`. Tests cover both preservation and replacement, including the
+Android component ID and board properties outside the RAMDisk location.
+
+The `lavender-rescue.S` prototype can be assembled with
+`clang -target arm64-apple-ios16.0 -mcpu=cortex-a53 -c` and wrapped with
+`tools/mkinit.py`. It attempts a read-only HFSX mount at `/sbin`, dumps three
+accessibility preference files as hex, then unmounts and remains alive at
+the console. It is a standalone `rd=md0` inspection boot, not an iOS GUI
+startup. Its assembly/signature build passed; the device inspection result
+was not verified before the user chose a clean rootfs restore.
 
 ## Rootfs from Termux
 
