@@ -326,7 +326,9 @@ LavenderGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, 
 		fMemory[type - 1]->retain();
 		*memory = fMemory[type - 1];
 		*options = fPoolN[type - 1] != 0 ? kIOMapWriteCombineCache : 0;
-		IOLog("LavenderGPU: map of buffer %u (%s)\n", (unsigned)type, fPoolN[type - 1] != 0 ? "pool" : "own");
+		if (gLavVerbose) {
+			IOLog("LavenderGPU: map of buffer %u (%s)\n", (unsigned)type, fPoolN[type - 1] != 0 ? "pool" : "own");
+		}
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gLavLock);
@@ -399,7 +401,9 @@ LavenderGPUUserClient::bufferNew(struct lav_buf_new * request)
 	request->address = fAddress[slot];
 	request->size = size;
 	IOLockUnlock(gLavLock);
-	IOLog("LavenderGPU: buffer %u: pa %llx size %llu%s\n", request->handle, request->address, size, npages != 0 ? " (pool)" : "");
+	if (gLavVerbose) {
+		IOLog("LavenderGPU: buffer %u: pa %llx size %llu%s\n", request->handle, request->address, size, npages != 0 ? " (pool)" : "");
+	}
 	return kIOReturnSuccess;
 }
 
