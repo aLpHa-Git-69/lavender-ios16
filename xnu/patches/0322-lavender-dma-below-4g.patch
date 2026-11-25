@@ -1,0 +1,54 @@
+From: port_ios lavender
+Subject: [PATCH 0322] lavender: keep eMMC/USB/GPU DMA buffers below 4 GB
+
+diff --git a/bsd/dev/lavender_gpu.c b/bsd/dev/lavender_gpu.c
+index 5a55a5b..569d4d5 100644
+--- a/bsd/dev/lavender_gpu.c
++++ b/bsd/dev/lavender_gpu.c
+@@ -486,7 +486,8 @@ lav_alloc(vm_size_t size, vm_offset_t mask, vm_offset_t *va, uint64_t *pa)
+ 	ppnum_t pn;
+ 
+ 	*va = 0;
+-	if (kmem_alloc_contig(kernel_map, va, size, mask, 0, 0,
++	if (kmem_alloc_contig(kernel_map, va, size, mask,
++	    (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
+ 	    KERN_SUCCESS) {
+ 		return ENOMEM;
+diff --git a/bsd/dev/santoni_sdhci.c b/bsd/dev/santoni_sdhci.c
+index 6cad3a5..26f4845 100644
+--- a/bsd/dev/santoni_sdhci.c
++++ b/bsd/dev/santoni_sdhci.c
+@@ -4932,7 +4932,8 @@ santoni_sdhci_init(void)
+ 		printf("WHYRED SDHCI: no mapping for GCC sdcc1_apps\n");
+ 		return ENXIO;
+ 	}
+-	if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK,
++	    (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
+ 	    KERN_SUCCESS) {
+ 		printf("WHYRED SDHCI: no contiguous bounce buffer\n");
+@@ -4949,7 +4950,7 @@ santoni_sdhci_init(void)
+ 		(void)PE_parse_boot_argn("sweetemmc_dma", &want, sizeof(want));
+ 		if (want &&
+ 		    kmem_alloc_contig(kernel_map, &se.adma, ADMA_TABLE_BYTES,
+-		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    PAGE_MASK, (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+ 		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+ 			ppnum_t apn = pmap_find_phys(kernel_pmap,
+ 			    (addr64_t)se.adma);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 7a414f5..cf72f92 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1448,7 +1448,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
++	    (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+ 		return;

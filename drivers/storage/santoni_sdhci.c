@@ -4932,7 +4932,8 @@ santoni_sdhci_init(void)
 		printf("WHYRED SDHCI: no mapping for GCC sdcc1_apps\n");
 		return ENXIO;
 	}
-	if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK, 0, 0,
+	if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK,
+	    (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0,
 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
 		printf("WHYRED SDHCI: no contiguous bounce buffer\n");
@@ -4949,7 +4950,7 @@ santoni_sdhci_init(void)
 		(void)PE_parse_boot_argn("sweetemmc_dma", &want, sizeof(want));
 		if (want &&
 		    kmem_alloc_contig(kernel_map, &se.adma, ADMA_TABLE_BYTES,
-		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+		    PAGE_MASK, (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1), 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
 		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 			ppnum_t apn = pmap_find_phys(kernel_pmap,
 			    (addr64_t)se.adma);
