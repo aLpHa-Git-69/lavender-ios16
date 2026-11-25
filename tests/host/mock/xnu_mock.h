@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <stdlib.h>
 
@@ -40,13 +41,18 @@ typedef unsigned int boolean_t;
 #ifndef MIN
 #define MIN(a, b)               ((a) < (b) ? (a) : (b))
 #endif
+#ifndef PAGE_SHIFT
+#define PAGE_SHIFT              14
+#endif
 #define PAGE_MASK               0x3fffu
 #define ptoa_64(x)              ((uint64_t)(x) << 14)
 #define KMA_DATA                1
 #define KMA_ZERO                2
 #define KMA_PERMANENT           4
 #define VM_KERN_MEMORY_IOKIT    0
+#ifndef __unused
 #define __unused                __attribute__((unused))
+#endif
 #define os_atomic_load(p, m)    (*(p))
 #define os_atomic_add_orig(p, v, m) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
 
