@@ -105,6 +105,14 @@ def fixture(root):
     plugin = root / "Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin"
     plugin.mkdir(parents=True)
     (plugin / "test").write_bytes(b"plugin")
+    staged = root / "private/var/staged_system_apps/Calculator.app"
+    staged.mkdir(parents=True)
+    (staged / "Calculator").write_bytes(b"calc")
+    plist(root, "System/Library/xpc/extensions.plist", {"dummy": True})
+    plist(root, "System/Library/PrivateFrameworks/PosterKit.framework/Info.plist",
+          {"NSExtensionSDK": {"com.apple.posterkit.provider": {"NSExtensionPointIdentifier": "com.apple.posterkit.provider"}}})
+    plist(root, "System/Library/ExtensionKit/ExtensionPoints/com.apple.sample.appexpt",
+          {"com.apple.sample": {"2": {"EX": True}}})
 
 
 def test_prepare(td):
@@ -125,6 +133,12 @@ def test_prepare(td):
     assert jobs["keep"]["_PanicOnCrasX"] is True
     assert not (root / "Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin").exists()
     assert (root / "Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin/test").is_file()
+    assert (root / "Applications/Calculator.app/Calculator").is_file()
+    assert (root / "private/var/mobile/Documents").is_dir()
+    assert not (root / "System/Library/xpc/extensions.plist").exists()
+    assert (root / "System/Library/xpc/extensions.plist.stock").is_file()
+    ep = rootfs.load_plist(root, "System/Library/ExtensionKit/ExtensionPoints/com.apple.posterkit.provider.appexpt")
+    assert ep["com.apple.posterkit.provider"]["2"]["NSExtensionPointIdentifier"] == "com.apple.posterkit.provider"
     for name in ("com.apple.migration", "com.apple.DataMigration"):
         path = root / rootfs.PREFS / f"{name}.plist"
         assert (path.stat().st_mode & 0o777) == 0o600
