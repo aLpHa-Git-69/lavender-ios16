@@ -448,6 +448,8 @@ AppleCLCD::start(IOService *provider)
 			OSSafeReleaseNULL(fCons);
 		}
 	}
+#elif defined(ARM64_BOARD_CONFIG_LAVENDER)
+	sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
 #endif
 	uint32_t hz = 10;
 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
@@ -573,7 +575,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		memcpy(fb->fShowHold, taken, sizeof(taken));
 		IOLockUnlock(fb->fLock);
 	}
-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - now, &ns);
+	uint64_t us = ns / 1000;
+	uint32_t nextUs = us + 1000 < SWEET_FB_VSYNC_US ? (uint32_t)(SWEET_FB_VSYNC_US - us) : 1000u;
+	sender->setTimeoutUS(nextUs);
 }
 
 void
@@ -593,6 +599,38 @@ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
 		fClients->removeObject(i);
 	}
 	IOLockUnlock(fLock);
+}
+
+/* Kernel-safe ARM64 GPR streaming copy (WB -> WC panel): no FP/NEON registers touched. */
+static void
+sweet_fb_copy_row(uint8_t *dst, const uint8_t *src, size_t n)
+{
+#if defined(__aarch64__)
+	size_t c64 = n >> 6;
+	if (c64 != 0 && (((uintptr_t)dst | (uintptr_t)src) & 7u) == 0) {
+		__asm__ volatile(
+		    "1:\n"
+		    "prfm pldl1strm, [%[s], #256]\n"
+		    "ldp x3, x4, [%[s]], #16\n"
+		    "ldp x5, x6, [%[s]], #16\n"
+		    "ldp x7, x8, [%[s]], #16\n"
+		    "ldp x9, x10, [%[s]], #16\n"
+		    "stnp x3, x4, [%[d]]\n"
+		    "stnp x5, x6, [%[d], #16]\n"
+		    "stnp x7, x8, [%[d], #32]\n"
+		    "stnp x9, x10, [%[d], #48]\n"
+		    "add %[d], %[d], #64\n"
+		    "subs %[c], %[c], #1\n"
+		    "b.ne 1b\n"
+		    : [d] "+r"(dst), [s] "+r"(src), [c] "+r"(c64)
+		    :
+		    : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "cc", "memory");
+		n &= 63u;
+	}
+#endif
+	if (n != 0) {
+		memcpy(dst, src, n);
+	}
 }
 
 static uint32_t
@@ -1112,10 +1150,18 @@ AppleCLCD::present(const uint8_t *rec)
 			src = 0;
 		}
 		if (src != 0 && bpe == 4) {
+			static uint32_t profLogged;
+			uint64_t pt0 = profLogged < 12 ? mach_absolute_time() : 0;
 			for (int32_t y = 0; y < h; y++) {
-				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+				sweet_fb_copy_row((uint8_t *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+				    (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
 				    (size_t)w * 4);
+			}
+			if (pt0 != 0) {
+				uint64_t pns = 0;
+				absolutetime_to_nanoseconds(mach_absolute_time() - pt0, &pns);
+				IOLog("SWEET FB: present #%u %llu us (%dx%d scanout=%d)\n",
+				    profLogged++, pns / 1000, w, h, s->scanoutPhys != 0 ? 1 : 0);
 			}
 		}
 		s->release();

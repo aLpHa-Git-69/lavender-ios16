@@ -329,8 +329,12 @@ lav_gpu_clock(void)
 		base = CC_GPU_PLL1_MODE; l = 0x21; alpha = 0x55555600u; alpha_u = 0x55; user = 0x01200101u; cfg = 0x303;
 	} else if (mhz == 266) {
 		base = CC_GPU_PLL0_MODE; l = 0x1b; alpha = 0x55555600u; alpha_u = 0xb5; user = 0x01200001u; cfg = 0x103;
+	} else if (mhz == 370) {
+		base = CC_GPU_PLL0_MODE; l = 0x26; alpha = 0xaaaaaaabu; alpha_u = 0x8a; user = 0x01200001u; cfg = 0x103;
+	} else if (mhz == 465) {
+		base = CC_GPU_PLL0_MODE; l = 0x30; alpha = 0x00000000u; alpha_u = 0x70; user = 0x01200001u; cfg = 0x103;
 	} else {
-		printf("LAVGPU: lavgpuclk=%u is not 160 or 266\n", mhz);
+		printf("LAVGPU: lavgpuclk=%u is not 160, 266, 370 or 465\n", mhz);
 		return;
 	}
 	printf("LAVGPU: clock: gfx3d rcg cfg %08x, PLL mode %08x -> %u MHz\n", rd(gpucc, CC_GFX3D_RCG_CFG),
@@ -2778,6 +2782,17 @@ lavender_gpu_service_submit(const uint32_t *dw, uint32_t count, int *status)
 	if (ring_submit("service stream") != 0) {
 		*status = EIO;
 		return 0;
+	}
+	{
+		uint64_t spin_until;
+		clock_interval_to_deadline(250, NSEC_PER_USEC, &spin_until);
+		while (mach_absolute_time() < spin_until) {
+			flush_dcache64((addr64_t)(rptr_pa + 0xe00), 64, TRUE);
+			if (*f == seq) {
+				return seq;
+			}
+			__asm__ volatile("yield" ::: "memory");
+		}
 	}
 	for (int i = 0; i < 10000; i++) {
 		flush_dcache64((addr64_t)(rptr_pa + 0xe00), 64, TRUE);

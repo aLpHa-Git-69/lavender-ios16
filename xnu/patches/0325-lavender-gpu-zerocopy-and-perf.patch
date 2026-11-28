@@ -1,0 +1,405 @@
+From: port_ios lavender
+Subject: [PATCH 0325] lavender: zero-copy scanout surfaces, fast panel copy, 60 Hz vsync pacing, 370/465 MHz GPU clock
+
+1. Reserve an early physically-contiguous WB scanout pool (up to 5 x 12 MiB)
+   in SweetSurface for lavender full-screen surfaces, matching topaz geometry.
+2. Add kLavSurfaceInfo (6) and kLavSurfaceSync (7) on LavenderGPUUserClient so
+   LavenderMetal renders directly into contiguous IOSurfaces (0 ms sync copy)
+   using real sweet_dcache_clean / sweet_dcache_flush maintenance.
+3. Optimize SweetFramebuffer::present() with kernel-safe ARM64 GPR prfm+stnp
+   streaming copy and fix vsyncFired() timer drift by subtracting present time.
+4. Add 370 MHz and 465 MHz GPU_PLL0 options to lavgpuclk= and a 250 us fence
+   spin in lavender_gpu_service_submit().
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 19ef8ab..27621f2 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -35,6 +35,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+@@ -96,12 +97,20 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+-/* topaz scanout: at most 6 contiguous 16 MiB surfaces */
++/* scanout: contiguous low-4 GiB surfaces (lavender reserves an early WB pool for zero-copy GPU) */
++#if defined(ARM64_BOARD_CONFIG_LAVENDER)
++#define SWEET_SCANOUT_SLOT      (12u << 20)
++#define SWEET_SCANOUT_SLOTS     5
++#else
+ #define SWEET_SCANOUT_SLOT      (16u << 20)
+ #define SWEET_SCANOUT_SLOTS     6
++#endif
+ static uint32_t sweet_scanout_used;             /* bit per slot, sweet_surface_lock */
+ static uint32_t sweet_scanout_w[2], sweet_scanout_h[2];
+ static int      sweet_scanout_enabled = -1;
++static IOBufferMemoryDescriptor *sweet_scanout_pool;
++static uint64_t sweet_scanout_pool_phys;
++static uint32_t sweet_scanout_pool_slots;
+ 
+ void
+ sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2)
+@@ -110,6 +119,29 @@ sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2)
+ 	sweet_scanout_h[0] = h1;
+ 	sweet_scanout_w[1] = w2;
+ 	sweet_scanout_h[1] = h2;
++#if defined(ARM64_BOARD_CONFIG_LAVENDER)
++	if (sweet_scanout_pool == NULL) {
++		static const uint32_t tries[] = { SWEET_SCANOUT_SLOTS, 4, 3, 2 };
++		for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
++			uint64_t bytes = (uint64_t)tries[i] * SWEET_SCANOUT_SLOT;
++			IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++			    bytes, 0x00000000fffff000ull);
++			if (m != NULL) {
++				uint64_t pa = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++				if (pa != 0 && pa + bytes <= 0x100000000ull) {
++					sweet_scanout_pool = m;
++					sweet_scanout_pool_phys = pa;
++					sweet_scanout_pool_slots = tries[i];
++					IOLog("SWEET SURF: lavender scanout pool %u slots (%llu MB) at pa %#llx\n",
++					    tries[i], bytes >> 20, pa);
++					break;
++				}
++				m->release();
++			}
++		}
++	}
++#endif
+ }
+ 
+ static bool
+@@ -136,8 +168,9 @@ static int
+ sweet_scanout_alloc_slot(void)
+ {
+ 	int slot = -1;
++	int limit = sweet_scanout_pool != NULL ? (int)sweet_scanout_pool_slots : SWEET_SCANOUT_SLOTS;
+ 	IOLockLock(sweet_surface_lock);
+-	for (int i = 0; i < SWEET_SCANOUT_SLOTS; i++) {
++	for (int i = 0; i < limit; i++) {
+ 		if (!(sweet_scanout_used & (1u << i))) {
+ 			sweet_scanout_used |= 1u << i;
+ 			slot = i;
+@@ -182,6 +215,9 @@ SweetSurface::free()
+ uintptr_t
+ SweetSurface::kernelAddress()
+ {
++	if (scanoutSlot >= 0 && sweet_scanout_pool != NULL && (uint32_t)scanoutSlot < sweet_scanout_pool_slots) {
++		return (uintptr_t)sweet_scanout_pool->getBytesNoCopy() + (uint64_t)scanoutSlot * SWEET_SCANOUT_SLOT;
++	}
+ 	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
+ 	if (buffer != NULL) {
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+@@ -827,23 +863,32 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_scanout_eligible(s)) {
+ 		int slot = sweet_scanout_alloc_slot();
+ 		if (slot >= 0) {
+-			/*
+-			 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
+-			 * bypassed). A raw physical window outside the kernel's RAM maps as
+-			 * Device memory, where bzero/memcpy take alignment faults.
+-			 */
+-			IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+-			    s->allocSize, 0x00000000fffff000ull);
+-			uint64_t pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-			if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
+-				cmem->release();
+-				cmem = NULL;
+-			}
+-			if (cmem != NULL) {
+-				OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++			uint64_t pa = 0;
++			if (sweet_scanout_pool != NULL && (uint32_t)slot < sweet_scanout_pool_slots) {
++				s->memory = IOSubMemoryDescriptor::withSubRange(sweet_scanout_pool,
++				    (uint64_t)slot * SWEET_SCANOUT_SLOT, s->allocSize, kIODirectionInOut);
++				if (s->memory != NULL) {
++					pa = sweet_scanout_pool_phys + (uint64_t)slot * SWEET_SCANOUT_SLOT;
++				}
++			} else {
++				/*
++				 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
++				 * bypassed). A raw physical window outside the kernel's RAM maps as
++				 * Device memory, where bzero/memcpy take alignment faults.
++				 */
++				IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++				    s->allocSize, 0x00000000fffff000ull);
++				pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++				if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
++					cmem->release();
++					cmem = NULL;
++				}
++				if (cmem != NULL) {
++					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++				}
++				s->memory = cmem;
+ 			}
+-			s->memory = cmem;
+ 			if (s->memory != NULL) {
+ 				s->scanoutPhys = pa;
+ 				s->scanoutSlot = slot;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3349ea7..db83b92 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -448,6 +448,8 @@ AppleCLCD::start(IOService *provider)
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 	}
++#elif defined(ARM64_BOARD_CONFIG_LAVENDER)
++	sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ #endif
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+@@ -573,7 +575,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - now, &ns);
++	uint64_t us = ns / 1000;
++	uint32_t nextUs = us + 1000 < SWEET_FB_VSYNC_US ? (uint32_t)(SWEET_FB_VSYNC_US - us) : 1000u;
++	sender->setTimeoutUS(nextUs);
+ }
+ 
+ void
+@@ -595,6 +601,38 @@ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ 	IOLockUnlock(fLock);
+ }
+ 
++/* Kernel-safe ARM64 GPR streaming copy (WB -> WC panel): no FP/NEON registers touched. */
++static void
++sweet_fb_copy_row(uint8_t *dst, const uint8_t *src, size_t n)
++{
++#if defined(__aarch64__)
++	size_t c64 = n >> 6;
++	if (c64 != 0 && (((uintptr_t)dst | (uintptr_t)src) & 7u) == 0) {
++		__asm__ volatile(
++		    "1:\n"
++		    "prfm pldl1strm, [%[s], #256]\n"
++		    "ldp x3, x4, [%[s]], #16\n"
++		    "ldp x5, x6, [%[s]], #16\n"
++		    "ldp x7, x8, [%[s]], #16\n"
++		    "ldp x9, x10, [%[s]], #16\n"
++		    "stnp x3, x4, [%[d]]\n"
++		    "stnp x5, x6, [%[d], #16]\n"
++		    "stnp x7, x8, [%[d], #32]\n"
++		    "stnp x9, x10, [%[d], #48]\n"
++		    "add %[d], %[d], #64\n"
++		    "subs %[c], %[c], #1\n"
++		    "b.ne 1b\n"
++		    : [d] "+r"(dst), [s] "+r"(src), [c] "+r"(c64)
++		    :
++		    : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "cc", "memory");
++		n &= 63u;
++	}
++#endif
++	if (n != 0) {
++		memcpy(dst, src, n);
++	}
++}
++
+ static uint32_t
+ get32(const uint8_t *p, uint32_t off)
+ {
+@@ -1112,11 +1150,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			static uint32_t profLogged;
++			uint64_t pt0 = profLogged < 12 ? mach_absolute_time() : 0;
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				sweet_fb_copy_row((uint8_t *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				    (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			if (pt0 != 0) {
++				uint64_t pns = 0;
++				absolutetime_to_nanoseconds(mach_absolute_time() - pt0, &pns);
++				IOLog("SWEET FB: present #%u %llu us (%dx%d scanout=%d)\n",
++				    profLogged++, pns / 1000, w, h, s->scanoutPhys != 0 ? 1 : 0);
++			}
+ 		}
+ 		s->release();
+ 	}
+diff --git a/iokit/Kernel/arm/LavenderGPU.cpp b/iokit/Kernel/arm/LavenderGPU.cpp
+index 2f99bf2..590ddc4 100644
+--- a/iokit/Kernel/arm/LavenderGPU.cpp
++++ b/iokit/Kernel/arm/LavenderGPU.cpp
+@@ -31,12 +31,15 @@
+ #include <kern/thread.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include "SweetSurface.h"
+ 
+ extern "C" {
+ int lavender_gpu_service_ready(void);
+ uint32_t lavender_gpu_service_submit(const uint32_t * dwords, uint32_t count, int * status);
+ void LavenderGPUStart(void);
+ void LavenderGPUSelfTest(void);
++void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);
+ }
+ 
+ enum {
+@@ -46,6 +49,8 @@ enum {
+ 	kLavSubmit      = 3,
+ 	kLavSubmitBuf   = 4,
+ 	kLavMetal       = 5,
++	kLavSurfaceInfo = 6,
++	kLavSurfaceSync = 7,
+ };
+ 
+ #define LAV_BUFFERS     256
+@@ -69,6 +74,14 @@ struct lav_submit_out {
+ struct lav_submit_buf {
+ 	uint32_t handle, offset, dwords, pad;
+ };
++struct lav_surface_info {
++	uint32_t surface_id, pad;
++	uint64_t address;
++	uint32_t size, bytes_per_row;
++};
++struct lav_surface_sync {
++	uint32_t surface_id, op;        /* 0 = clean (CPU->GPU), 1 = flush+inv (GPU->CPU) */
++};
+ 
+ static IOLock * gLavLock;
+ static uint32_t gLavSubmits, gLavLast;
+@@ -273,6 +286,8 @@ class LavenderGPUUserClient : public IOUserClient
+ 	IOReturn submit(IOExternalMethodArguments * args, struct lav_submit_out * out);
+ 	IOReturn submitBuf(const struct lav_submit_buf * request, struct lav_submit_out * out);
+ 	IOReturn run(uint32_t * words, size_t size, struct lav_submit_out * out);
++	IOReturn surfaceInfo(struct lav_surface_info * request);
++	IOReturn surfaceSync(const struct lav_surface_sync * request);
+ 
+ public:
+ 	bool selfTest(void);
+@@ -512,6 +527,50 @@ LavenderGPUUserClient::submitBuf(const struct lav_submit_buf * request, struct l
+ 	return run(words, size, out);
+ }
+ 
++IOReturn
++LavenderGPUUserClient::surfaceInfo(struct lav_surface_info * request)
++{
++	request->address = 0;
++	request->size = 0;
++	request->bytes_per_row = 0;
++#if defined(SWEET)
++	SweetSurface * s = sweet_surface_copy(request->surface_id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->scanoutPhys != 0 && s->allocSize != 0 &&
++	    s->scanoutPhys + s->allocSize <= 0x100000000ULL &&
++	    (s->bytesPerRow & 63u) == 0 && ((s->scanoutPhys + s->offset) & 63u) == 0) {
++		request->address = s->scanoutPhys + s->offset;
++		request->size = s->allocSize;
++		request->bytes_per_row = s->bytesPerRow;
++	}
++	s->release();
++#endif
++	return kIOReturnSuccess;
++}
++
++IOReturn
++LavenderGPUUserClient::surfaceSync(const struct lav_surface_sync * request)
++{
++#if defined(SWEET)
++	SweetSurface * s = sweet_surface_copy(request->surface_id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	uintptr_t va = s->kernelAddress();
++	if (va != 0 && s->allocSize != 0) {
++		if (request->op == 0) {
++			sweet_dcache_clean((vm_offset_t)va, s->allocSize);
++		} else {
++			sweet_dcache_flush((vm_offset_t)va, s->allocSize);
++		}
++	}
++	s->release();
++#endif
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ LavenderGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+@@ -521,6 +580,8 @@ LavenderGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		struct lav_buf_new bufNew;
+ 		struct lav_buf_free bufFree;
+ 		struct lav_submit_out out;
++		struct lav_surface_info surfInfo;
++		struct lav_surface_sync surfSync;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	IOReturn ret = kIOReturnSuccess;
+@@ -573,6 +634,21 @@ LavenderGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		}
+ 		ret = lavMetalSet(*(const uint32_t *)args->structureInput);
+ 		break;
++	case kLavSurfaceInfo:
++		if (args->structureInput == NULL || size < sizeof(uint32_t)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&r.surfInfo, args->structureInput, size < sizeof(r.surfInfo) ? size : sizeof(r.surfInfo));
++		ret = surfaceInfo(&r.surfInfo);
++		outSize = sizeof(r.surfInfo);
++		break;
++	case kLavSurfaceSync:
++		if (args->structureInput == NULL || size < sizeof(struct lav_surface_sync)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&r.surfSync, args->structureInput, sizeof(r.surfSync));
++		ret = surfaceSync(&r.surfSync);
++		break;
+ 	default:
+ 		IOLog("LavenderGPU: request %u is not known here\n", selector);
+ 		return kIOReturnUnsupported;
+diff --git a/bsd/dev/lavender_gpu.c b/bsd/dev/lavender_gpu.c
+index ff8f516..fb2ad8d 100644
+--- a/bsd/dev/lavender_gpu.c
++++ b/bsd/dev/lavender_gpu.c
+@@ -329,8 +329,12 @@ lav_gpu_clock(void)
+ 		base = CC_GPU_PLL1_MODE; l = 0x21; alpha = 0x55555600u; alpha_u = 0x55; user = 0x01200101u; cfg = 0x303;
+ 	} else if (mhz == 266) {
+ 		base = CC_GPU_PLL0_MODE; l = 0x1b; alpha = 0x55555600u; alpha_u = 0xb5; user = 0x01200001u; cfg = 0x103;
++	} else if (mhz == 370) {
++		base = CC_GPU_PLL0_MODE; l = 0x26; alpha = 0xaaaaaaabu; alpha_u = 0x8a; user = 0x01200001u; cfg = 0x103;
++	} else if (mhz == 465) {
++		base = CC_GPU_PLL0_MODE; l = 0x30; alpha = 0x00000000u; alpha_u = 0x70; user = 0x01200001u; cfg = 0x103;
+ 	} else {
+-		printf("LAVGPU: lavgpuclk=%u is not 160 or 266\n", mhz);
++		printf("LAVGPU: lavgpuclk=%u is not 160, 266, 370 or 465\n", mhz);
+ 		return;
+ 	}
+ 	printf("LAVGPU: clock: gfx3d rcg cfg %08x, PLL mode %08x -> %u MHz\n", rd(gpucc, CC_GFX3D_RCG_CFG),
+@@ -2779,6 +2783,17 @@ lavender_gpu_service_submit(const uint32_t *dw, uint32_t count, int *status)
+ 		*status = EIO;
+ 		return 0;
+ 	}
++	{
++		uint64_t spin_until;
++		clock_interval_to_deadline(250, NSEC_PER_USEC, &spin_until);
++		while (mach_absolute_time() < spin_until) {
++			flush_dcache64((addr64_t)(rptr_pa + 0xe00), 64, TRUE);
++			if (*f == seq) {
++				return seq;
++			}
++			__asm__ volatile("yield" ::: "memory");
++		}
++	}
+ 	for (int i = 0; i < 10000; i++) {
+ 		flush_dcache64((addr64_t)(rptr_pa + 0xe00), 64, TRUE);
+ 		if (*f == seq) {

@@ -35,6 +35,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/system.h>
@@ -96,12 +97,20 @@ static uint32_t      sweet_surface_creates_logged;
 static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 
-/* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+/* scanout: contiguous low-4 GiB surfaces (lavender reserves an early WB pool for zero-copy GPU) */
+#if defined(ARM64_BOARD_CONFIG_LAVENDER)
+#define SWEET_SCANOUT_SLOT      (12u << 20)
+#define SWEET_SCANOUT_SLOTS     5
+#else
 #define SWEET_SCANOUT_SLOT      (16u << 20)
 #define SWEET_SCANOUT_SLOTS     6
+#endif
 static uint32_t sweet_scanout_used;             /* bit per slot, sweet_surface_lock */
 static uint32_t sweet_scanout_w[2], sweet_scanout_h[2];
 static int      sweet_scanout_enabled = -1;
+static IOBufferMemoryDescriptor *sweet_scanout_pool;
+static uint64_t sweet_scanout_pool_phys;
+static uint32_t sweet_scanout_pool_slots;
 
 void
 sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2)
@@ -110,6 +119,29 @@ sweet_scanout_set_geometry(uint32_t w1, uint32_t h1, uint32_t w2, uint32_t h2)
 	sweet_scanout_h[0] = h1;
 	sweet_scanout_w[1] = w2;
 	sweet_scanout_h[1] = h2;
+#if defined(ARM64_BOARD_CONFIG_LAVENDER)
+	if (sweet_scanout_pool == NULL) {
+		static const uint32_t tries[] = { SWEET_SCANOUT_SLOTS, 4, 3, 2 };
+		for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
+			uint64_t bytes = (uint64_t)tries[i] * SWEET_SCANOUT_SLOT;
+			IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+			    bytes, 0x00000000fffff000ull);
+			if (m != NULL) {
+				uint64_t pa = m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+				if (pa != 0 && pa + bytes <= 0x100000000ull) {
+					sweet_scanout_pool = m;
+					sweet_scanout_pool_phys = pa;
+					sweet_scanout_pool_slots = tries[i];
+					IOLog("SWEET SURF: lavender scanout pool %u slots (%llu MB) at pa %#llx\n",
+					    tries[i], bytes >> 20, pa);
+					break;
+				}
+				m->release();
+			}
+		}
+	}
+#endif
 }
 
 static bool
@@ -136,8 +168,9 @@ static int
 sweet_scanout_alloc_slot(void)
 {
 	int slot = -1;
+	int limit = sweet_scanout_pool != NULL ? (int)sweet_scanout_pool_slots : SWEET_SCANOUT_SLOTS;
 	IOLockLock(sweet_surface_lock);
-	for (int i = 0; i < SWEET_SCANOUT_SLOTS; i++) {
+	for (int i = 0; i < limit; i++) {
 		if (!(sweet_scanout_used & (1u << i))) {
 			sweet_scanout_used |= 1u << i;
 			slot = i;
@@ -182,6 +215,9 @@ SweetSurface::free()
 uintptr_t
 SweetSurface::kernelAddress()
 {
+	if (scanoutSlot >= 0 && sweet_scanout_pool != NULL && (uint32_t)scanoutSlot < sweet_scanout_pool_slots) {
+		return (uintptr_t)sweet_scanout_pool->getBytesNoCopy() + (uint64_t)scanoutSlot * SWEET_SCANOUT_SLOT;
+	}
 	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, memory);
 	if (buffer != NULL) {
 		return (uintptr_t)buffer->getBytesNoCopy();
@@ -827,23 +863,32 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_scanout_eligible(s)) {
 		int slot = sweet_scanout_alloc_slot();
 		if (slot >= 0) {
-			/*
-			 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
-			 * bypassed). A raw physical window outside the kernel's RAM maps as
-			 * Device memory, where bzero/memcpy take alignment faults.
-			 */
-			IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
-			    s->allocSize, 0x00000000fffff000ull);
-			uint64_t pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
-			if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
-				cmem->release();
-				cmem = NULL;
+			uint64_t pa = 0;
+			if (sweet_scanout_pool != NULL && (uint32_t)slot < sweet_scanout_pool_slots) {
+				s->memory = IOSubMemoryDescriptor::withSubRange(sweet_scanout_pool,
+				    (uint64_t)slot * SWEET_SCANOUT_SLOT, s->allocSize, kIODirectionInOut);
+				if (s->memory != NULL) {
+					pa = sweet_scanout_pool_phys + (uint64_t)slot * SWEET_SCANOUT_SLOT;
+				}
+			} else {
+				/*
+				 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
+				 * bypassed). A raw physical window outside the kernel's RAM maps as
+				 * Device memory, where bzero/memcpy take alignment faults.
+				 */
+				IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+				    s->allocSize, 0x00000000fffff000ull);
+				pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+				if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
+					cmem->release();
+					cmem = NULL;
+				}
+				if (cmem != NULL) {
+					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+				}
+				s->memory = cmem;
 			}
-			if (cmem != NULL) {
-				OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
-			}
-			s->memory = cmem;
 			if (s->memory != NULL) {
 				s->scanoutPhys = pa;
 				s->scanoutSlot = slot;
